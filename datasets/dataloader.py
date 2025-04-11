@@ -25,16 +25,21 @@ def extract_pitch_alongtime(line):
     data_unit = parts[1:]
 
     pitch_ls = []
-    for i in range(0, len(data_unit), 2):
-        suffix = data_unit[i].split('_')[-1]
+    for i in range(0, len(data_unit)-1, 2):
+        suffix = data_unit[i+1].split('_')[-1]
         if suffix.isdigit():
-            pitch_ls.append(int(suffix))
+            pitch_ls.append(int(suffix)) # for the phoneme
+            pitch_ls.append(int(suffix)) # for the pitch token itself
         else:
+            # pitch_ls.append(-1) # there will also be some SP, AP
             i+=1 # '<svs_placeholder>'
+
+    # import pdb
+    # pdb.set_trace()
     return uttid, pitch_ls
 
 class AudioDataset(Dataset):
-    def __init__(self, audio_dir, transform=None, sample_rate=16000):
+    def __init__(self, audio_dir, transform=None, sample_rate=16000, label_file="/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/tr_no_dev/label"):
         self.audio_dir = audio_dir
         self.audio_files = [
             f for f in os.listdir(audio_dir)
@@ -43,7 +48,7 @@ class AudioDataset(Dataset):
         self.transform = transform
         self.sample_rate = sample_rate
 
-        self.label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/tr_no_dev/label"
+        self.label_file = label_file # dataset split
         self.pitch_ls = preprocess_pitch(self.label_file)
 
     def __len__(self):

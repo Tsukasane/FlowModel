@@ -112,7 +112,7 @@ class ConditionalDecoder(nn.Module):
         # self.linear_input_project = nn.Linear(80, 512) # mel to feats
         # self.linear_output_project = nn.Linear(512, 80) # feats to mel
 
-        output_channel = in_channels
+        output_channel = in_channels # TODO(yiwen) adjust for cond
         for i in range(len(channels)):  # pylint: disable=consider-using-enumerate
             input_channel = output_channel
             output_channel = channels[i]
@@ -237,7 +237,7 @@ class ConditionalDecoder(nn.Module):
         
         hiddens = []
         masks = [mask] # 32, 1, 361
-
+        
         # NOTE(yiwen) current unet/transformer blocks didn't take conditions
         for resnet, transformer_blocks, downsample in self.down_blocks:
             mask_down = masks[-1] # # mask_down.shape [32, 1, 347]
