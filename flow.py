@@ -40,7 +40,6 @@ import logging
 logging.basicConfig(level=logging.INFO)
 
 from torch.utils.tensorboard import SummaryWriter
-writer = SummaryWriter()
 
 class MaskedDiff(torch.nn.Module):
     def __init__(self,
@@ -340,6 +339,8 @@ def train_one_epoch(model,
         total_loss = 0
         num_batch = 0
 
+        num_batch_per_epoch = len(train_data_loader)
+
         for batch_waveforms, lengths, filenames, pitch in train_data_loader:
             
             num_batch += 1
@@ -371,9 +372,9 @@ def train_one_epoch(model,
             
             batch_loss = output_loss_dic['loss']
             if num_batch%10==0:
-                print(f'debug -- batch loss {batch_loss.item()}')
+                print(f'batch {num_batch} / total {num_batch_per_epoch} -- batch loss {batch_loss.item()}')
             if num_batch%100==0:
-                writer.add_scalar('Loss/train_batch', batch_loss.item(), epoch * len(train_data_loader) * num_batch) # cal by iteration
+                writer.add_scalar('Loss/train_batch', batch_loss.item(), epoch_id * len(train_data_loader) + num_batch) # cal by iteration
             # if num_batch==100: # for debug
             #     break
             total_loss += batch_loss.item()
@@ -386,15 +387,15 @@ def train_one_epoch(model,
         logging.info(f'Training Loss for Epoch {epoch_id}: {total_loss}')
 
         # TODO(yiwen) save model (is able to resume on)
-        if epoch_id % 2 ==0:
-            if os.path.exists(save_path):
-                os.rename(save_path, './latest_bu_new.pth')
-            torch.save({
-                'epoch': epoch_id,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': total_loss, # only the number with no gradient
-                }, save_path)
+        # if epoch_id % 2 ==0:
+        if os.path.exists(save_path):
+            os.rename(save_path, './latest_bu_new.pth')
+        torch.save({
+            'epoch': epoch_id,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': total_loss, # only the number with no gradient
+            }, save_path)
 
 
 def collate_fn_test(batch):
@@ -427,8 +428,6 @@ def inference(model,
               device='cpu',
               codec_per_frame=8,
               ssl_per_frame=1,
-              pad_id=-62670,
-              place_holder_id=88,
               sample_rate=16000,
               output_dir='./output'): 
     '''
@@ -471,23 +470,29 @@ def inference(model,
         pitch_tensors = torch.tensor(processed_pitch)
         
         output_feats = model.inference(flatten_code_embedding, lengths, sample_rate, pitch_tensors)
-        
+
         with torch.no_grad():
             waveform = codec_model.decode_continuous(output_feats).squeeze(1).cpu().numpy()
+            # waveform = codec_model.decode_continuous(flatten_code_embedding).squeeze(1).cpu().numpy() # debug, decode the original codec embedding
 
         save_name = os.path.join(output_dir, f'save_{filenames[0]}.wav')
         sf.write(save_name, waveform.T, samplerate=sample_rate)
 
 
-
 if __name__=='__main__':
+
+    # TODO(yiwen) larger batch size, more data?
+                # can make only some of them as conditional data, and also do cfg in some portion.
+                # if no supervision, only need waveform
+    # TODO(yiwen) check whether need to provide t in inference 
+                # (because the vector field is time dependent, and dirty distribution is not the orignal source distribution (Gaussian) in training)
     
     device = "cuda:0"
     valid_step = 10
     total_epochs = 20
 
     batch_size = 64
-    train = True
+    train = False
     train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/tr_no_dev/label" # NOTE(yiwen) debugging
     test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/test/label"
     output_dir = './output'
@@ -511,11 +516,13 @@ if __name__=='__main__':
     )
 
     # NOTE(yiwen) temp choice
-    optimizer = torch.optim.Adam(maskedDiff.parameters(), lr=0.001)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.9)
+    optimizer = torch.optim.AdamW(maskedDiff.parameters(), lr=0.001, weight_decay=0.0001)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.9)
 
 
     if train:
+        writer = SummaryWriter()
+
         ### train dataloader
         train_dataset = AudioDataset("./datasets/wav_dump/", 
                                         transform=None, 
@@ -541,7 +548,7 @@ if __name__=='__main__':
         # batchsize=1 in inference
         test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=True, num_workers=0, collate_fn=collate_fn_test)
 
-        checkpoint = torch.load("/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/latest_model.pth", weights_only=True)
+        checkpoint = torch.load("/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/latest_model_new.pth", weights_only=True)
         maskedDiff.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         epoch = checkpoint['epoch']

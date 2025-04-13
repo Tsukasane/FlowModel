@@ -1,3 +1,6 @@
 *.out
 store/
 *.log
+*.pth
+runs/
+output*/
