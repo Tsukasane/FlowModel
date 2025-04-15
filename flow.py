@@ -60,7 +60,6 @@ class MaskedDiff(torch.nn.Module):
                                                           'n_blocks': 4, 'num_mid_blocks': 12, 'num_heads': 8, 'act_fn': 'gelu'}},
                  mel_feat_conf: Dict = {'n_fft': 1024, 'num_mels': 128, 'sampling_rate': 48000,
                                         'hop_size': 256, 'win_size': 1024, 'fmin': 0, 'fmax': 48000},
-                generator_model_dir: str = "flow_model/pretrained_quantizer/music_tokenizer",
                 num_codebooks: int = 4,
                 device: str = 'cpu',
                 ):
@@ -165,7 +164,7 @@ class MaskedDiff(torch.nn.Module):
         ) # get the feature, then pass to the vocoder
 
         feat = feat.transpose(1,2)
-        print(f'debug -- feat.shape {feat.shape}') # 1, 512, 269
+        # print(f'debug -- feat.shape {feat.shape}') # 1, 512, 269
     
         # TODO(yiwen) decode feat
         return feat
@@ -422,6 +421,49 @@ def valid(valid_data_loader):
     pass
 
 
+def delete_zeros_from_segments(lst, num_to_delete=1):
+    if num_to_delete == -1: # no 0
+        return lst
+    result = []
+    i = 0
+    n = len(lst)
+    while i < n:
+        if lst[i] != 0:
+            result.append(lst[i])
+            i += 1
+        else:
+            start = i
+            while i < n and lst[i] == 0:
+                i += 1
+            segment_len = i - start
+            remaining_zeros = [0] * max(0, segment_len - num_to_delete)
+            result.extend(remaining_zeros)
+    return result
+
+
+def find_shortest_zero_segment(lst):
+    min_len = float('inf')
+    min_pos = None
+    i = 0
+    n = len(lst)
+    while i < n:
+        if lst[i] == 0:
+            start = i
+            while i < n and lst[i] == 0:
+                i += 1
+            seg_len = i - start
+            if seg_len > 1 and seg_len < min_len:
+                min_len = seg_len
+                min_pos = start
+        else:
+            i += 1
+    if min_pos is not None:
+        return min_len
+    else:
+        return -1
+
+
+
 def inference(model,
               dataloader,
               codec_model,
@@ -457,8 +499,16 @@ def inference(model,
         codec_T = flatten_code_embedding.shape[1]
         processed_pitch = []
 
-        # NOTE(yiwen) this is still not a well-aligned matching
+        # NOTE(yiwen) better pitch alignment in inference
         for pc in pitch:
+            '''
+            if pitch ls too short, do padding
+            if pitch ls too long, del zero first (each segment del min segment length)
+                then assume zeros are at the tail, cut them
+            '''
+            if len(pc)-codec_T>20: # pitch_ls too long
+                del_length = find_shortest_zero_segment(pc)
+                pc = delete_zeros_from_segments(pc, del_length)
             if len(pc)<codec_T:
                 updated_pitch = pc + [0] * (codec_T - len(pc)) 
                 processed_pitch.append(updated_pitch)        
@@ -489,13 +539,15 @@ if __name__=='__main__':
     
     device = "cuda:0"
     valid_step = 10
-    total_epochs = 20
+    total_epochs = 100
 
     batch_size = 64
     train = False
     train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/tr_no_dev/label" # NOTE(yiwen) debugging
     test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/test/label"
     output_dir = './output'
+
+    latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/latest_model_new.pth"
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -529,8 +581,17 @@ if __name__=='__main__':
                                         sample_rate=16000, 
                                         label_file=train_label_file)
         train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=collate_fn)
-        
-        for epoch in range(total_epochs):
+        pretrain_epoch = 0
+
+        if os.path.exists(latest_model_file):
+            checkpoint = torch.load(latest_model_file, weights_only=True)
+            maskedDiff.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            pretrain_epoch = checkpoint['epoch']
+            loss = checkpoint['loss']
+            logging.info(f"Resume from {latest_model_file}, epoch {pretrain_epoch}")
+
+        for epoch in range(pretrain_epoch, total_epochs):
             maskedDiff.train()
             train_one_epoch(maskedDiff, optimizer, scheduler, train_data_loader, codec_model, device, epoch)
         

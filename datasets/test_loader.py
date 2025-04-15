@@ -17,12 +17,15 @@ def extract_pitch_alongtime(line):
     data_unit = parts[1:]
 
     pitch_ls = []
-    for i in range(0, len(data_unit), 2):
+    for i in range(len(data_unit)):
         suffix = data_unit[i].split('_')[-1]
         if suffix.isdigit():
+            prev_data = data_unit[i-1]
+            prev_suffix = prev_data.split('_')[-1]
+            if prev_suffix == 'AP' or prev_suffix == 'SP': # skip the pitch of non_phoneme, aspirate slience
+                pitch_ls.append(0)
+                continue
             pitch_ls.append(int(suffix))
-        else:
-            i+=1 # '<svs_placeholder>'
     return uttid, pitch_ls
 
 
