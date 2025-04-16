@@ -40,6 +40,22 @@ import logging
 logging.basicConfig(level=logging.INFO)
 
 from torch.utils.tensorboard import SummaryWriter
+import numpy as np
+
+
+def set_seed(seed=42):
+    # Python built-in random
+    random.seed(seed)
+    np.random.seed(seed)
+
+    # PyTorch (CPU and CUDA)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # for multi-GPU setups
+
+    # For reproducibility in dataloaders with worker_init_fn
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
 
 class MaskedDiff(torch.nn.Module):
     def __init__(self,
@@ -96,9 +112,6 @@ class MaskedDiff(torch.nn.Module):
         codec_continuous_feats = batch['codec_continuous_feats']  # 32, 349, 512
         codec_token_len = batch['codec_feats_len']
         pitch = batch['pitch']
-        # log_mel = batch['log_mel'] # 32, 349, 80
-        # h1, h1_lengths = self.encoder(log_mel, codec_token_len) # if using mel as x
-        # h1, h1_lengths = self.length_regulator(h1, codec_token_len) 
 
         h, h_lengths = self.encoder(codec_continuous_feats, codec_token_len) # in_features=512   32, 349, 512,    32, 1, 349 bool according to codec token len
         h, h_lengths = self.length_regulator(h, codec_token_len) 
@@ -146,8 +159,8 @@ class MaskedDiff(torch.nn.Module):
         # flatten_code_embedding, lengths, pitch
 
         # token.shape [1, 185, 512]
-        h, h_lengths = self.encoder(token, token_len)
-        h, h_lengths = self.length_regulator(h, token_len)  
+        h, _ = self.encoder(token, token_len)
+        h, _ = self.length_regulator(h, token_len)  
 
         # get conditions
         conds = pitch # pitch
@@ -165,8 +178,7 @@ class MaskedDiff(torch.nn.Module):
 
         feat = feat.transpose(1,2)
         # print(f'debug -- feat.shape {feat.shape}') # 1, 512, 269
-    
-        # TODO(yiwen) decode feat
+
         return feat
 
 
@@ -274,153 +286,6 @@ def waveform_to_mel(
     return log_mel_spec.squeeze(0)  # (n_mels, T')
 
 
-
-def collate_fn(batch):
-    # padding to max length in a batch
-    waveforms = [item['waveform'] for item in batch]
-    lengths = torch.tensor([item['length'] for item in batch])
-    filenames = [item['filename'] for item in batch]
-    pitchs = [item['pitch'] for item in batch]
-
-    max_len = max(lengths)
-
-    padded_waveforms = torch.zeros(len(waveforms), 1, max_len)
-    for i, w in enumerate(waveforms):
-        padded_waveforms[i, :, :w.shape[1]] = w
-
-    return padded_waveforms, lengths, filenames, pitchs
-
-
-
-def get_codec(codec_model, waveform, length, down_sample_rate=40, codec_layer_num=8):
-    '''
-    Args:
-        - codec_model: pretrained codec tokenizer
-        - length: waveform sample number
-    Return:
-        - codec_continuous_feats (tensor): detokenized continuous codecfeatures (B, T, D)
-        - codec_feats_len (tensor): frame-wise length (B)
-    '''
-    
-    batch = {}
-    codec_hop_size = 320
-
-    # NOTE(yiwen) this is from discrete ids (/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/espnet2/gan_codec/dac/dac.py)
-    with torch.no_grad():
-        flatten_codes, _ = codec_model(waveform)
-        # print(f"flatten_codes", flatten_codes) #torch.Size([1, 1536])
-        codec_continuous_feats = codec_model.detokenize(flatten_codes).transpose(1, 2)
-
-    # feats length
-    codec_token_len = (length+codec_hop_size-1) / codec_hop_size 
-    codec_token_len = codec_token_len.to(int).to(device)
-    # codec_token_len = torch.tensor([codec_continuous_feats.shape[1]]).to(device)
-    batch['codec_continuous_feats'] = codec_continuous_feats
-    batch['codec_feats_len'] = codec_token_len
-
-    return batch
-
-
-def train_one_epoch(model, 
-                    optimizer, 
-                    scheduler, 
-                    train_data_loader, 
-                    codec_model,
-                    device,
-                    epoch_id=0,
-                    save_path='./latest_model_new.pth'):
-        ''' Train one epoch
-        '''
-
-        lr = optimizer.param_groups[0]['lr']
-        logging.info('Epoch {} TRAIN info lr {} '.format(epoch_id+1, lr))
-    
-        total_loss = 0
-        num_batch = 0
-
-        num_batch_per_epoch = len(train_data_loader)
-
-        for batch_waveforms, lengths, filenames, pitch in train_data_loader:
-            
-            num_batch += 1
-            batch_waveforms = batch_waveforms.to(device) # 32, 1, 116718
-            input_batch = get_codec(codec_model, batch_waveforms, lengths) # codec embedding
-
-            codec_T = input_batch['codec_continuous_feats'].shape[1]
-
-            processed_pitch = []
-
-            # NOTE(yiwen) this is still not a well-aligned matching
-            for pc in pitch:
-                if len(pc)<codec_T:
-                    updated_pitch = pc + [0] * (codec_T - len(pc)) 
-                    processed_pitch.append(updated_pitch)        
-                elif len(pc)==codec_T:
-                    processed_pitch.append(pc)
-                else:
-                    updated_pitch = pc[:codec_T]
-                    processed_pitch.append(updated_pitch)
-            
-    
-            pitch_tensors = torch.tensor(processed_pitch)
-        
-            input_batch['pitch'] = pitch_tensors.to(device)
-
-            optimizer.zero_grad()
-            output_loss_dic = model(input_batch, device)
-            
-            batch_loss = output_loss_dic['loss']
-            if num_batch%10==0:
-                print(f'batch {num_batch} / total {num_batch_per_epoch} -- batch loss {batch_loss.item()}')
-            if num_batch%100==0:
-                writer.add_scalar('Loss/train_batch', batch_loss.item(), epoch_id * len(train_data_loader) + num_batch) # cal by iteration
-            # if num_batch==100: # for debug
-            #     break
-            total_loss += batch_loss.item()
-            batch_loss.backward()
-            optimizer.step()
-        
-        scheduler.step()
-
-        total_loss /= num_batch
-        logging.info(f'Training Loss for Epoch {epoch_id}: {total_loss}')
-
-        # TODO(yiwen) save model (is able to resume on)
-        # if epoch_id % 2 ==0:
-        if os.path.exists(save_path):
-            os.rename(save_path, './latest_bu_new.pth')
-        torch.save({
-            'epoch': epoch_id,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': total_loss, # only the number with no gradient
-            }, save_path)
-
-
-def collate_fn_test(batch):
-
-    flatten_codes = [item['flatten_code'] for item in batch]
-    lengths = torch.tensor([item['length'] for item in batch])
-    filenames = [item['filename'] for item in batch]
-    pitchs = [item['pitch'] for item in batch]
-
-    max_len = max(lengths)
-
-    # pad flatten_code to the max length in a batch
-    # TODO(yiwen) check the padding id of flatten code (-62670)
-    padded_flatten_code = torch.zeros(len(flatten_codes), max_len)
-    flatten_codes = [torch.tensor(fc) for fc in flatten_codes]
-
-    for i, fc in enumerate(flatten_codes):
-        padded_flatten_code[i, :fc.shape[0]] = fc
-
-    return padded_flatten_code, lengths, filenames, pitchs
-
-
-def valid(valid_data_loader):
-    pass
-
-
 def delete_zeros_from_segments(lst, num_to_delete=1):
     if num_to_delete == -1: # no 0
         return lst
@@ -461,7 +326,160 @@ def find_shortest_zero_segment(lst):
         return min_len
     else:
         return -1
+    
 
+def collate_fn(batch):
+    # padding to max length in a batch
+    waveforms = [item['waveform'] for item in batch]
+    lengths = torch.tensor([item['length'] for item in batch])
+    filenames = [item['filename'] for item in batch]
+    pitchs = [item['pitch'] for item in batch]
+
+    max_len = max(lengths)
+
+    padded_waveforms = torch.zeros(len(waveforms), 1, max_len)
+    for i, w in enumerate(waveforms):
+        padded_waveforms[i, :, :w.shape[1]] = w
+
+    return padded_waveforms, lengths, filenames, pitchs
+
+
+
+def get_codec(codec_model, waveform, length):
+    '''
+    Args:
+        - codec_model: pretrained codec tokenizer
+        - length: waveform sample number
+    Return:
+        - codec_continuous_feats (tensor): detokenized continuous codecfeatures (B, T, D)
+        - codec_feats_len (tensor): frame-wise length (B)
+    '''
+    
+    batch = {}
+    codec_hop_size = 320
+
+    # NOTE(yiwen) this is from discrete ids (/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/espnet2/gan_codec/dac/dac.py)
+    with torch.no_grad():
+        flatten_codes, _ = codec_model(waveform)
+        # print(f"flatten_codes", flatten_codes) #torch.Size([1, 1536])
+        codec_continuous_feats = codec_model.detokenize(flatten_codes).transpose(1, 2)
+
+    # feats length
+    codec_token_len = (length+codec_hop_size-1) / codec_hop_size 
+    codec_token_len = codec_token_len.to(int).to(device)
+    # codec_token_len = torch.tensor([codec_continuous_feats.shape[1]]).to(device)
+    batch['codec_continuous_feats'] = codec_continuous_feats
+    batch['codec_feats_len'] = codec_token_len
+
+    return batch
+
+
+def train_one_epoch(model, 
+                    optimizer, 
+                    scheduler, 
+                    train_data_loader, 
+                    codec_model,
+                    device,
+                    epoch_id=0,
+                    save_path='./latest_pitch_new.pth'):
+        ''' Train one epoch
+        '''
+
+        lr = optimizer.param_groups[0]['lr']
+        logging.info('Epoch {} TRAIN info lr {} '.format(epoch_id+1, lr))
+    
+        total_loss = 0
+        num_batch = 0
+
+        num_batch_per_epoch = len(train_data_loader)
+
+        for batch_waveforms, lengths, filenames, pitch in train_data_loader:
+            
+            num_batch += 1
+            batch_waveforms = batch_waveforms.to(device) # 32, 1, 116718
+            input_batch = get_codec(codec_model, batch_waveforms, lengths) # codec embedding
+
+            codec_T = input_batch['codec_continuous_feats'].shape[1]
+
+            processed_pitch = []
+
+            # NOTE(yiwen) better aligned pitch
+            for pc in pitch:
+                '''
+                if pitch ls too short, do padding
+                if pitch ls too long, del zero first (each segment del min 0 segment length)
+                    then assume redundant zeros are all at the tail, cut them
+                '''
+                if len(pc)-codec_T>20: # pitch_ls too long
+                    del_length = find_shortest_zero_segment(pc)
+                    pc = delete_zeros_from_segments(pc, del_length)
+                if len(pc)<codec_T:
+                    updated_pitch = pc + [0] * (codec_T - len(pc)) 
+                    processed_pitch.append(updated_pitch)        
+                elif len(pc)==codec_T:
+                    processed_pitch.append(pc)
+                else:
+                    updated_pitch = pc[:codec_T]
+                    processed_pitch.append(updated_pitch)
+            
+    
+            pitch_tensors = torch.tensor(processed_pitch)
+        
+            input_batch['pitch'] = pitch_tensors.to(device)
+
+            optimizer.zero_grad()
+            output_loss_dic = model(input_batch, device)
+            
+            batch_loss = output_loss_dic['loss']
+            if num_batch%10==0:
+                print(f'batch {num_batch} / total {num_batch_per_epoch} -- batch loss {batch_loss.item()}')
+            if num_batch%100==0:
+                writer.add_scalar('Loss/train_batch', batch_loss.item(), epoch_id * len(train_data_loader) + num_batch) # cal by iteration
+            # if num_batch==100: # for debug
+            #     break
+            total_loss += batch_loss.item()
+            batch_loss.backward()
+            optimizer.step()
+        
+        scheduler.step()
+
+        total_loss /= num_batch
+        logging.info(f'Training Loss for Epoch {epoch_id}: {total_loss}')
+
+        # TODO(yiwen) save model (is able to resume on)
+        # if epoch_id % 2 ==0:
+        if os.path.exists(save_path):
+            os.rename(save_path, './latest_bu_pitch.pth')
+        torch.save({
+            'epoch': epoch_id,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': total_loss, # only the number with no gradient
+            }, save_path)
+
+
+def collate_fn_test(batch):
+
+    flatten_codes = [item['flatten_code'] for item in batch]
+    lengths = torch.tensor([item['length'] for item in batch])
+    filenames = [item['filename'] for item in batch]
+    pitchs = [item['pitch'] for item in batch]
+
+    max_len = max(lengths)
+
+    # pad flatten_code to the max length in a batch
+    # TODO(yiwen) check the padding id of flatten code (-62670)
+    padded_flatten_code = torch.zeros(len(flatten_codes), max_len)
+    flatten_codes = [torch.tensor(fc) for fc in flatten_codes]
+
+    for i, fc in enumerate(flatten_codes):
+        padded_flatten_code[i, :fc.shape[0]] = fc
+
+    return padded_flatten_code, lengths, filenames, pitchs
+
+
+def valid(valid_data_loader):
+    pass
 
 
 def inference(model,
@@ -503,8 +521,8 @@ def inference(model,
         for pc in pitch:
             '''
             if pitch ls too short, do padding
-            if pitch ls too long, del zero first (each segment del min segment length)
-                then assume zeros are at the tail, cut them
+            if pitch ls too long, del zero first (each segment del min 0 segment length)
+                then assume redundant zeros are all at the tail, cut them
             '''
             if len(pc)-codec_T>20: # pitch_ls too long
                 del_length = find_shortest_zero_segment(pc)
@@ -531,12 +549,15 @@ def inference(model,
 
 if __name__=='__main__':
 
+    set_seed(42)
+
     # TODO(yiwen) larger batch size, more data?
                 # can make only some of them as conditional data, and also do cfg in some portion.
                 # if no supervision, only need waveform
     # TODO(yiwen) check whether need to provide t in inference 
                 # (because the vector field is time dependent, and dirty distribution is not the orignal source distribution (Gaussian) in training)
-    
+    # TODO(yiwen) add some visualization
+                # tSNE, mel spectrogram
     device = "cuda:0"
     valid_step = 10
     total_epochs = 100
@@ -547,7 +568,7 @@ if __name__=='__main__':
     test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/test/label"
     output_dir = './output'
 
-    latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/latest_model_new.pth"
+    latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/latest_pitch_new.pth"
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -568,7 +589,7 @@ if __name__=='__main__':
     )
 
     # NOTE(yiwen) temp choice
-    optimizer = torch.optim.AdamW(maskedDiff.parameters(), lr=0.001, weight_decay=0.0001)
+    optimizer = torch.optim.AdamW(maskedDiff.parameters(), lr=0.0005, weight_decay=0.0001)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.9)
 
 
@@ -609,7 +630,7 @@ if __name__=='__main__':
         # batchsize=1 in inference
         test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=True, num_workers=0, collate_fn=collate_fn_test)
 
-        checkpoint = torch.load("/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/latest_model_new.pth", weights_only=True)
+        checkpoint = torch.load(latest_model_file, weights_only=True)
         maskedDiff.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         epoch = checkpoint['epoch']
