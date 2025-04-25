@@ -406,10 +406,12 @@ def train_one_epoch(model,
             # NOTE(yiwen) better aligned pitch
             for pc in pitch:
                 '''
+                NOTE(yiwen) basicly aligned, super long song / short phn / round in duration may cause mismatch
                 if pitch ls too short, do padding
                 if pitch ls too long, del zero first (each segment del min 0 segment length)
                     then assume redundant zeros are all at the tail, cut them
                 '''
+                # print(f'debug -- difference {len(pc)-codec_T}')
                 if len(pc)-codec_T>20: # pitch_ls too long
                     del_length = find_shortest_zero_segment(pc)
                     pc = delete_zeros_from_segments(pc, del_length)
@@ -563,9 +565,9 @@ if __name__=='__main__':
     total_epochs = 100
 
     batch_size = 64
-    train = False
-    train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/tr_no_dev/label" # NOTE(yiwen) debugging
-    test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/test/label"
+    train = True
+    train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/kising/speechlm1/dump/audio_raw_svs_kising/tr_no_dev/label" # NOTE(yiwen) debugging
+    test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump_naacl/audio_raw_svs_acesinger/test/label"
     output_dir = './output'
 
     latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/latest_pitch_new.pth"
@@ -597,7 +599,7 @@ if __name__=='__main__':
         writer = SummaryWriter()
 
         ### train dataloader
-        train_dataset = AudioDataset("./datasets/wav_dump/", 
+        train_dataset = AudioDataset("./datasets/kising_wav_dump/", 
                                         transform=None, 
                                         sample_rate=16000, 
                                         label_file=train_label_file)

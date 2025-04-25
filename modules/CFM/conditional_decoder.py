@@ -205,7 +205,7 @@ class ConditionalDecoder(nn.Module):
         """Forward pass of the UNet1DConditional model.
 
         Args:
-            x (torch.Tensor): shape (batch_size, in_channels, time) 32, 512, 357
+            x (torch.Tensor): the interpolated distribution between source and target along time. shape (batch_size, in_channels, time) 32, 512, 357
             mask (_type_): shape (batch_size, 1, time)
             t (_type_): shape (batch_size)
             spks (_type_, optional): shape: (batch_size, condition_channels). Defaults to None.

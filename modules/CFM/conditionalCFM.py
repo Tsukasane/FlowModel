@@ -139,7 +139,7 @@ class ConditionalCFM(BASECFM):
             t = 1 - torch.cos(t * 0.5 * torch.pi) # 32, 1, 1
         
         z = torch.randn_like(x1) # 32, 512, 360 TODO(yiwen) x1 gt 可以改成mel，从noise mel到good mel
-        y = (1 - (1 - self.sigma_min) * t) * z + t * x1 # position along time
+        y = (1 - (1 - self.sigma_min) * t) * z + t * x1 # position(interpolated distribution) along time
         u = x1 - (1 - self.sigma_min) * z # 32, 512, 360 velocity along time
 
         # u是学习的target，一个从random gaussian 到x1分布的 time dependent 速度场

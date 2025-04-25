@@ -25,17 +25,11 @@ def extract_pitch_alongtime(line):
     data_unit = parts[1:]
 
     pitch_ls = []
-    for i in range(0, len(data_unit)-1, 2):
-        suffix = data_unit[i+1].split('_')[-1]
+    for i in range(len(data_unit)):
+        suffix = data_unit[i].split('_')[-1]
         if suffix.isdigit():
             pitch_ls.append(int(suffix)) # for the phoneme
-            pitch_ls.append(int(suffix)) # for the pitch token itself
-        else:
-            # pitch_ls.append(-1) # there will also be some SP, AP
-            i+=1 # '<svs_placeholder>'
 
-    # import pdb
-    # pdb.set_trace()
     return uttid, pitch_ls
 
 class AudioDataset(Dataset):
@@ -75,7 +69,7 @@ class AudioDataset(Dataset):
         return {
             "waveform": waveform,              # shape: [1, T]
             "length": waveform.shape[1],       # T
-            "filename": self.audio_files[idx],
+            "filename": filename,
             "pitch": pitch
         }
 
