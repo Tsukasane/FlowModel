@@ -226,7 +226,7 @@ class ConditionalDecoder(nn.Module):
         # if x.shape[1]!=mu.shape[1]: # mu.shape[1] is fixed to 512
         #     x = self.linear_input_project(x.transpose(1,2)).transpose(1,2) # NOTE(yiwen) add this temporaly
 
-        x = pack([x, mu], "b * t")[0] # 32, 512, 357 --> 32, 1024, 357 TODO(yiwen)把x和encoder output pack起来有什么意义吗
+        x = pack([x, mu], "b * t")[0] # 32, 512, 357 --> 32, 1024, 357 distribution along probability path || clean condition TODO(yiwen)把x和encoder output pack起来有什么意义吗
 
         if spks is not None:
             spks = repeat(spks, "b c -> b c t", t=x.shape[-1])

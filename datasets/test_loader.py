@@ -33,7 +33,7 @@ def extract_pitch_alongtime(line):
 class TestDataset(Dataset):
     def __init__(self, scp_root, label_file, ark_root, sample_rate=16000):
         
-        split_size = 1 # 32
+        split_size = 2 # 32
 
         self.pitch_dict = {}
         self.flattenCode_dict = {}
@@ -69,6 +69,7 @@ class TestDataset(Dataset):
         # debug TODO(yiwen) check what are these two scp
         # scp_path = '/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/exp/speechlm_naacl_demo_1.7B_lr5e-6/decode_tts_espnet_sampling_temperature0.8_finetune_47epoch/svs_test/log/output.1/wav.scp/rank0_token_wav.scp.scp'
         # scp_path = '/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/exp/speechlm_naacl_demo_1.7B_lr5e-6/decode_tts_espnet_sampling_temperature0.8_finetune_41epoch/svs_test/log/output.1/wav.scp/rank0_token_wav.scp.scp'
+        
         with open(scp_path, 'r') as file:
             for line in file:
                 uttid = line.strip().split()[0]
@@ -92,7 +93,7 @@ class TestDataset(Dataset):
 
     def __getitem__(self, idx):
         filename, flatten_code = self.flattenCode_ls[idx]
-        pitch_key = "_".join(filename.split('_')[1:3]) + '.wav'
+        pitch_key = "_".join(filename.split('_')[1:-1]) + '.wav'
         pitch = self.pitch_dict[pitch_key]
 
         return {
@@ -111,6 +112,7 @@ def collate_fn(batch):
 
     max_len = max(lengths)
 
+    # use batch_size=1, no need padding
     # pad the pitch to the max length to a batch
     # longest_pitch = len(max(pitchs, key=len))
     # padded_pitch = [item['pitch'] + [0] * (longest_pitch - len(item['pitch'])) for item in batch]
@@ -137,8 +139,6 @@ if __name__ == "__main__":
 
     for flatten_code, lengths, filenames, pitch in dataloader:
         # NOTE(yiwen) do not support batch inference (set bs=1, so no padding)
-        import pdb
-        pdb.set_trace()
 
         print("Batch shape:", flatten_code.shape) 
         print("Filenames:", filenames)

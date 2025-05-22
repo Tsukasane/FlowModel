@@ -168,8 +168,8 @@ class MaskedDiff(torch.nn.Module):
         conds = self.linear_cond_pitch(conds).transpose(1,2)
 
         mask = (~make_pad_mask(token_len)).to(h)
-        feat = self.decoder(
-            mu=h.transpose(1, 2).contiguous(), # the input is the source
+        feat = self.decoder( # NOTE(yiwen) if not directly the source dis, pass t?
+            mu=h.transpose(1, 2).contiguous(), # the input is the source codec token embedding
             mask=mask.unsqueeze(1),
             spks=None,
             cond=conds,
@@ -410,6 +410,8 @@ def train_one_epoch(model,
                 if pitch ls too short, do padding
                 if pitch ls too long, del zero first (each segment del min 0 segment length)
                     then assume redundant zeros are all at the tail, cut them
+
+                在acesinger中，实际很多情况音频比note更长
                 '''
                 # print(f'debug -- difference {len(pc)-codec_T}')
                 if len(pc)-codec_T>20: # pitch_ls too long
@@ -564,10 +566,12 @@ if __name__=='__main__':
     valid_step = 10
     total_epochs = 100
 
-    batch_size = 64
-    train = True
-    train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/kising/speechlm1/dump/audio_raw_svs_kising/tr_no_dev/label" # NOTE(yiwen) debugging
-    test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump_naacl/audio_raw_svs_acesinger/test/label"
+    batch_size = 32
+    train = False
+    # train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/kising/speechlm1/dump/audio_raw_svs_kising/tr_no_dev/label" # NOTE(yiwen) debugging
+    # test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/kising/speechlm1/dump/audio_raw_svs_kising/eval/label"
+    train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/tr_no_dev/label" # NOTE(yiwen) debugging
+    test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/test/label"
     output_dir = './output'
 
     latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/latest_pitch_new.pth"
@@ -599,11 +603,11 @@ if __name__=='__main__':
         writer = SummaryWriter()
 
         ### train dataloader
-        train_dataset = AudioDataset("./datasets/kising_wav_dump/", 
+        train_dataset = AudioDataset("./datasets/wav_dump/", 
                                         transform=None, 
                                         sample_rate=16000, 
                                         label_file=train_label_file)
-        train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=collate_fn)
+        train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, collate_fn=collate_fn)
         pretrain_epoch = 0
 
         if os.path.exists(latest_model_file):
@@ -624,7 +628,7 @@ if __name__=='__main__':
 
     else:
         ### test dataloader (need flatten code, need corresponding pitch)
-        test_dataset = TestDataset(scp_root="/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/exp/speechlm_naacl_demo_1.7B_lr5e-6/decode_tts_espnet_sampling_temperature0.8_finetune_70epoch/svs_test/log",
+        test_dataset = TestDataset(scp_root="/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/exp/speechlm_opuslm_v1_1.7B_anneal_ext_phone_finetune_svs/decode_tts_espnet_sampling_temperature0.8_finetune_20epoch/svs_test/log",
                                     label_file=test_label_file,
                                     ark_root= "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1",
                                     sample_rate=16000, 
