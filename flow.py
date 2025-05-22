@@ -30,6 +30,7 @@ from modules.CFM.conditional_decoder import ConditionalDecoder
 from modules.CFM.length_regulator import InterpolateRegulator
 from datasets.dataloader import AudioDataset
 from datasets.test_loader import TestDataset
+from datasets.train_loader import TrainDataset
 from torch.utils.data import DataLoader
 
 from modules.codec_ssl_tokenizer.codec_tokenizer import get_codec_tokenizer
@@ -112,8 +113,9 @@ class MaskedDiff(torch.nn.Module):
         codec_continuous_feats = batch['codec_continuous_feats']  # 32, 349, 512
         codec_token_len = batch['codec_feats_len']
         pitch = batch['pitch']
+        source_codec_feats = batch['source_codec_feats']
 
-        h, h_lengths = self.encoder(codec_continuous_feats, codec_token_len) # in_features=512   32, 349, 512,    32, 1, 349 bool according to codec token len
+        h, h_lengths = self.encoder(source_codec_feats, codec_token_len) # in_features=512   32, 349, 512,    32, 1, 349 bool according to codec token len
         h, h_lengths = self.length_regulator(h, codec_token_len) 
 
         # ori, just give part of the feats as conditions
@@ -328,21 +330,45 @@ def find_shortest_zero_segment(lst):
         return -1
     
 
+# def collate_fn(batch):
+#     # padding to max length in a batch
+#     waveforms = [item['waveform'] for item in batch]
+#     lengths = torch.tensor([item['length'] for item in batch])
+#     filenames = [item['filename'] for item in batch]
+#     pitchs = [item['pitch'] for item in batch]
+
+#     max_len = max(lengths)
+
+#     padded_waveforms = torch.zeros(len(waveforms), 1, max_len)
+#     for i, w in enumerate(waveforms):
+#         padded_waveforms[i, :, :w.shape[1]] = w
+
+#     return padded_waveforms, lengths, filenames, pitchs
+
 def collate_fn(batch):
-    # padding to max length in a batch
     waveforms = [item['waveform'] for item in batch]
-    lengths = torch.tensor([item['length'] for item in batch])
+    flatten_codes = [item['flatten_code'] for item in batch]
+    lengths_waveform = torch.tensor([item['length_waveform'] for item in batch])
+    lengths_code = torch.tensor([item['length_code'] for item in batch])
     filenames = [item['filename'] for item in batch]
     pitchs = [item['pitch'] for item in batch]
 
-    max_len = max(lengths)
+    max_len_code = max(lengths_code)
+    max_len_wave = max(lengths_waveform)
+    
+    # NOTE(yiwen) the flatten code has probably already been padded
+    # pad flatten_code to the max length in a batch
+    # padded_flatten_code = torch.zeros(len(flatten_codes), max_len_code)
+    flatten_codes = [torch.tensor(fc) for fc in flatten_codes]
 
-    padded_waveforms = torch.zeros(len(waveforms), 1, max_len)
+    # for i, fc in enumerate(flatten_codes):
+    #     padded_flatten_code[i, :fc.shape[0]] = fc
+
+    padded_waveforms = torch.zeros(len(waveforms), 1, max_len_wave)
     for i, w in enumerate(waveforms):
         padded_waveforms[i, :, :w.shape[1]] = w
 
-    return padded_waveforms, lengths, filenames, pitchs
-
+    return flatten_codes, padded_waveforms, lengths_waveform, lengths_code, filenames, pitchs
 
 
 def get_codec(codec_model, waveform, length):
@@ -381,6 +407,9 @@ def train_one_epoch(model,
                     codec_model,
                     device,
                     epoch_id=0,
+                    codec_per_frame=8,
+                    ssl_per_frame=1,
+                    embedding_dim=512,
                     save_path='./latest_pitch_new.pth'):
         ''' Train one epoch
         '''
@@ -393,13 +422,45 @@ def train_one_epoch(model,
 
         num_batch_per_epoch = len(train_data_loader)
 
-        for batch_waveforms, lengths, filenames, pitch in train_data_loader:
-            
-            num_batch += 1
-            batch_waveforms = batch_waveforms.to(device) # 32, 1, 116718
-            input_batch = get_codec(codec_model, batch_waveforms, lengths) # codec embedding
+        codec_model.to(device)
+        codec_model.eval()
+        token_per_frame = codec_per_frame + ssl_per_frame
 
+        for flatten_token, batch_waveforms, lengths_waveform, lengths_code, filenames, pitch in train_data_loader:
+            num_batch += 1
+            # codec id to embedding
+            lengths_code = lengths_code.to(device)
+            flatten_code_embeddingls = []
+            max_code_length = 0
+            with torch.no_grad():
+                # cond codec embedding
+                for i, fc in enumerate(flatten_token):
+                    fc = fc.to(device).to(int) # already in range of codec, no padding, in shape [1, 1352]
+                    flatten_code_embedding = codec_model.detokenize(fc.unsqueeze(0)).transpose(1, 2)
+                    if flatten_code_embedding.shape[1]>max_code_length:
+                        max_code_length = flatten_code_embedding.shape[1]
+                    
+                    flatten_code_embeddingls.append(flatten_code_embedding)
+                    # flatten_code_embeddingls.append(codec_model.detokenize(fc.unsqueeze(0)).transpose(1, 2)) # 1, 159, 512
+            
+            batch_waveforms = batch_waveforms.to(device) # 32, 1, 116718
+            input_batch = get_codec(codec_model, batch_waveforms, lengths_waveform) # target codec embedding
             codec_T = input_batch['codec_continuous_feats'].shape[1]
+
+            print(f'debug -- codec_source_T {max_code_length}; codec_T {codec_T}') # difference is less than 10 frames
+            codec_min_length = codec_T # min(max_code_length, input_batch['codec_continuous_feats'].shape[1])
+            
+            # TODO(yiwen) regulate the legnth
+            padded_flatten_code = torch.zeros(len(flatten_token), max_code_length, embedding_dim)
+            for i, fc in enumerate(flatten_code_embeddingls):
+                padded_flatten_code[i:i+1, :fc.shape[1],:] = fc
+
+            flatten_code_embedding = padded_flatten_code[:,:codec_min_length,:]
+
+            lengths = lengths_code // 8 # code_per_frame
+            
+            input_batch['source_codec_feats'] = flatten_code_embedding.to(device)
+            input_batch['codec_continuous_feats'] = input_batch['codec_continuous_feats'][:,:codec_min_length,:]
 
             processed_pitch = []
 
@@ -425,10 +486,9 @@ def train_one_epoch(model,
                 else:
                     updated_pitch = pc[:codec_T]
                     processed_pitch.append(updated_pitch)
-            
-    
+
+            # padded to maxpitch in preprocessing
             pitch_tensors = torch.tensor(processed_pitch)
-        
             input_batch['pitch'] = pitch_tensors.to(device)
 
             optimizer.zero_grad()
@@ -567,7 +627,7 @@ if __name__=='__main__':
     total_epochs = 100
 
     batch_size = 32
-    train = False
+    train = True
     # train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/kising/speechlm1/dump/audio_raw_svs_kising/tr_no_dev/label" # NOTE(yiwen) debugging
     # test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/kising/speechlm1/dump/audio_raw_svs_kising/eval/label"
     train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/tr_no_dev/label" # NOTE(yiwen) debugging
@@ -603,11 +663,20 @@ if __name__=='__main__':
         writer = SummaryWriter()
 
         ### train dataloader
-        train_dataset = AudioDataset("./datasets/wav_dump/", 
-                                        transform=None, 
+        # train_dataset = AudioDataset("./datasets/wav_dump/", 
+        #                                 transform=None, 
+        #                                 sample_rate=16000, 
+        #                                 label_file=train_label_file)
+
+        # TODO(yiwen) modify the test scproot and label file to train
+        train_dataset = TrainDataset(audio_dir="./datasets/wav_dump/",
+                                        scp_root="/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/exp/speechlm_opuslm_v1_1.7B_anneal_ext_phone_finetune_svs/decode_tts_espnet_sampling_temperature0.8_finetune_40epoch/svs_test/log",
+                                        label_file=test_label_file,
+                                        ark_root= "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1",
                                         sample_rate=16000, 
-                                        label_file=train_label_file)
-        train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, collate_fn=collate_fn)
+                                        )
+
+        train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=collate_fn)
         pretrain_epoch = 0
 
         if os.path.exists(latest_model_file):
