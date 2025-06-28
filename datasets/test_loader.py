@@ -33,7 +33,7 @@ def extract_pitch_alongtime(line):
 class TestDataset(Dataset):
     def __init__(self, scp_root, label_file, ark_root, sample_rate=16000):
         
-        split_size = 2 # 32
+        split_size = 16
 
         self.pitch_dict = {}
         self.flattenCode_dict = {}

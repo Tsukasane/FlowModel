@@ -238,10 +238,10 @@ class ConditionalDecoder(nn.Module):
         hiddens = []
         masks = [mask] # 32, 1, 361
         
+        print(f'progress marker 2')
         # NOTE(yiwen) current unet/transformer blocks didn't take conditions
         for resnet, transformer_blocks, downsample in self.down_blocks:
             mask_down = masks[-1] # # mask_down.shape [32, 1, 347]
-
             x = resnet(x, mask_down, t) # c downsample 4
             x = rearrange(x, "b c t -> b t c").contiguous()
             attn_mask = torch.matmul(mask_down.transpose(1, 2).contiguous(), mask_down)
@@ -289,7 +289,7 @@ class ConditionalDecoder(nn.Module):
             x = upsample(x * mask_up)
         x = self.final_block(x, mask_up) # 32, 256, 381
 
-        output = self.final_proj(x * mask_up) 
+        output = self.final_proj(x * mask_up)
         # output = self.linear_output_project(output.transpose(1,2)).transpose(1,2) # 32, 80, 358
 
         return output * mask

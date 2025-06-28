@@ -109,14 +109,24 @@ class MaskedDiff(torch.nn.Module):
             batch: dict,
             device: torch.device,
     ) -> Dict[str, Optional[torch.Tensor]]:
+        """
+        Args:
+            - batch:
+                - codec_continuous_feats: clean codec embedding
+                - codec_feats_len: length of clean codec embedding
+                - pitch: pitch
+                - source_codec_feats: noisy codec embedding B, T, D
+                - mel_spectrogram: mel-spectrogram
+        """
 
-        codec_continuous_feats = batch['codec_continuous_feats']  # 32, 349, 512
+        # codec_continuous_feats = batch['codec_continuous_feats']  # 32, 349, 512
+        mel_spectrogram = batch['mel_spectrogram'] 
         codec_token_len = batch['codec_feats_len']
-        pitch = batch['pitch']
+        # pitch = batch['pitch']
         source_codec_feats = batch['source_codec_feats']
 
         h, h_lengths = self.encoder(source_codec_feats, codec_token_len) # in_features=512   32, 349, 512,    32, 1, 349 bool according to codec token len
-        h, h_lengths = self.length_regulator(h, codec_token_len) 
+        h, h_lengths = self.length_regulator(h, codec_token_len)
 
         # ori, just give part of the feats as conditions
         # if self.cond:
@@ -132,15 +142,17 @@ class MaskedDiff(torch.nn.Module):
 
         # conds is directly cat to x
         # TODO(yiwen) stretch the pitch according to codec_token_len (different among samples in a batch)
-        conds = pitch # B, T
+        # conds = pitch # B, T
+        conds = None
 
         mask = (~make_pad_mask(codec_token_len)).to(h) # TODO(yiwen) check the meaning of .to(h1)
-    
-        conds = conds.unsqueeze(-1).to(device).float()
-        conds = self.linear_cond_pitch(conds).transpose(1,2)
+        if conds:
+            conds = conds.unsqueeze(-1).to(device).float()
+            conds = self.linear_cond_pitch(conds).transpose(1,2)
 
         loss, _ = self.decoder.compute_loss( 
-                codec_continuous_feats.transpose(1,2), # the target for flow
+                # codec_continuous_feats.transpose(1,2), # the target for flow
+                mel_spectrogram,
                 mask.unsqueeze(1),
                 h.transpose(1, 2).contiguous(), # the encoder output (latent)
                 None,
@@ -164,6 +176,7 @@ class MaskedDiff(torch.nn.Module):
         h, _ = self.encoder(token, token_len)
         h, _ = self.length_regulator(h, token_len)  
 
+        print(f'progress marker 1')
         # get conditions
         conds = pitch # pitch
         conds = conds.unsqueeze(-1).to(device).float()
@@ -217,8 +230,8 @@ def init_modules(device):
     codec_model = get_codec_tokenizer(device)
 
     decoder_estimator = ConditionalDecoder(
-        in_channels=1536, # x || cond
-        out_channels=512,
+        in_channels=3072, # NOTE(yiwen) x || cond    1536 for codec embedding
+        out_channels=80, # NOTE(yiwen) 512 for codec embedding
         channels=[256, 256],
         dropout=0.0,
         attention_head_dim=64,
@@ -242,7 +255,6 @@ def init_modules(device):
     return encoder.to(device), length_regulator.to(device), decoder.to(device), codec_model.eval()
 
 
-# TODO(yiwen) check mel is in the same downsample rate as codec model
 def waveform_to_mel(
     waveform: torch.Tensor,
     sr: int = 16000,
@@ -410,8 +422,12 @@ def train_one_epoch(model,
                     codec_per_frame=8,
                     ssl_per_frame=1,
                     embedding_dim=512,
-                    save_path='./latest_pitch_new.pth'):
+                    save_path='./latest_pitch_new3.pth'):
         ''' Train one epoch
+        Args:
+            - flatten_token: noisy codec token
+            - batch_waveforms: clean waveform
+            - lengths_code: discrete noisy flatten codec token length
         '''
 
         lr = optimizer.param_groups[0]['lr']
@@ -428,69 +444,89 @@ def train_one_epoch(model,
 
         for flatten_token, batch_waveforms, lengths_waveform, lengths_code, filenames, pitch in train_data_loader:
             num_batch += 1
-            # codec id to embedding
+            input_batch = {}
+            
+            # NOTE GET CONDITION: discrete codec token to embedding
             lengths_code = lengths_code.to(device)
             flatten_code_embeddingls = []
+            code_length_all = []
             max_code_length = 0
             with torch.no_grad():
-                # cond codec embedding
                 for i, fc in enumerate(flatten_token):
                     fc = fc.to(device).to(int) # already in range of codec, no padding, in shape [1, 1352]
                     flatten_code_embedding = codec_model.detokenize(fc.unsqueeze(0)).transpose(1, 2)
+                    code_length_all.append(flatten_code_embedding.shape[1])
                     if flatten_code_embedding.shape[1]>max_code_length:
-                        max_code_length = flatten_code_embedding.shape[1]
-                    
+                        max_code_length = flatten_code_embedding.shape[1]                 
                     flatten_code_embeddingls.append(flatten_code_embedding)
-                    # flatten_code_embeddingls.append(codec_model.detokenize(fc.unsqueeze(0)).transpose(1, 2)) # 1, 159, 512
-            
-            batch_waveforms = batch_waveforms.to(device) # 32, 1, 116718
-            input_batch = get_codec(codec_model, batch_waveforms, lengths_waveform) # target codec embedding
-            codec_T = input_batch['codec_continuous_feats'].shape[1]
+            input_batch['codec_feats_len'] = torch.tensor(code_length_all).to(device) # valid continous codec embedding length for all elements in one batch
 
-            print(f'debug -- codec_source_T {max_code_length}; codec_T {codec_T}') # difference is less than 10 frames
-            codec_min_length = codec_T # min(max_code_length, input_batch['codec_continuous_feats'].shape[1])
-            
-            # TODO(yiwen) regulate the legnth
+            # unify the length of the condition (noisy codec embeddings)
             padded_flatten_code = torch.zeros(len(flatten_token), max_code_length, embedding_dim)
             for i, fc in enumerate(flatten_code_embeddingls):
                 padded_flatten_code[i:i+1, :fc.shape[1],:] = fc
-
-            flatten_code_embedding = padded_flatten_code[:,:codec_min_length,:]
-
+            flatten_code_embedding = padded_flatten_code[:,:max_code_length,:]
             lengths = lengths_code // 8 # code_per_frame
+            input_batch['source_codec_feats'] = flatten_code_embedding.to(device) # B, T_code, embedding_dim
             
-            input_batch['source_codec_feats'] = flatten_code_embedding.to(device)
-            input_batch['codec_continuous_feats'] = input_batch['codec_continuous_feats'][:,:codec_min_length,:]
+            # NOTE GET TARGET: clean waveform to mel-spectrogram
+            batch_waveforms = batch_waveforms.to(device) # 32, 1, 116718
+            # input_batch = get_codec(codec_model, batch_waveforms, lengths_waveform) # target codec embedding
+            # codec_T = input_batch['codec_continuous_feats'].shape[1] # clean code T
+            input_batch['mel_spectrogram'] = waveform_to_mel(batch_waveforms, device=device) # batchMEL
+            mel_T = get_batch_mel_lengths(lengths_waveform) # a list, mel T length of each waveform sample in a batch
+            mel_max_length = mel_T.max().item()
 
+            # NOTE align target (B, 1, 80, T) to source (B, T, 512)
+            B, T = input_batch['source_codec_feats'].shape[0], input_batch['source_codec_feats'].shape[1]
+            T_mel = input_batch['mel_spectrogram'].shape[-1]
+            mel_modified = -100 + torch.zeros([B, 1, 80, T]).to(device) # 0 padding in waveform after wavetomel, becomes -100 (TODO confirm)
+            minT = min(T, T_mel)
+            mel_modified[:,:,:,:minT] = input_batch['mel_spectrogram'][:,:,:,:minT]
+            
+            input_batch['mel_spectrogram'] = mel_modified
+            input_batch['source_codec_feats'] = input_batch['source_codec_feats']
+            # print(f'debug -- codec_source_T {max_code_length}; codec_T {codec_T}') # difference is less than 10 frames
+            # codec_min_length = codec_T # min(max_code_length, input_batch['codec_continuous_feats'].shape[1])
+            # input_batch['mel_spectrogram'] = input_batch['mel_spectrogram'][:,:,:,:mel_min_length] # B, 1, 80, mellength
+
+            # input_batch['codec_continuous_feats'] = input_batch['codec_continuous_feats'][:,:codec_min_length,:]
+
+
+            # input_batch['codec_feats_len'] = mel_T
+
+            # TODO(yiwen) think about other conditions as well
             processed_pitch = []
 
-            # NOTE(yiwen) better aligned pitch
-            for pc in pitch:
-                '''
-                NOTE(yiwen) basicly aligned, super long song / short phn / round in duration may cause mismatch
-                if pitch ls too short, do padding
-                if pitch ls too long, del zero first (each segment del min 0 segment length)
-                    then assume redundant zeros are all at the tail, cut them
+            # NOTE(yiwen) temp do not use pitch
+            # for pc in pitch:
+            #     '''
+            #     NOTE(yiwen) basicly aligned, super long song / short phn / round in duration may cause mismatch
+            #     if pitch ls too short, do padding
+            #     if pitch ls too long, del zero first (each segment del min 0 segment length)
+            #         then assume redundant zeros are all at the tail, cut them
 
-                在acesinger中，实际很多情况音频比note更长
-                '''
-                # print(f'debug -- difference {len(pc)-codec_T}')
-                if len(pc)-codec_T>20: # pitch_ls too long
-                    del_length = find_shortest_zero_segment(pc)
-                    pc = delete_zeros_from_segments(pc, del_length)
-                if len(pc)<codec_T:
-                    updated_pitch = pc + [0] * (codec_T - len(pc)) 
-                    processed_pitch.append(updated_pitch)        
-                elif len(pc)==codec_T:
-                    processed_pitch.append(pc)
-                else:
-                    updated_pitch = pc[:codec_T]
-                    processed_pitch.append(updated_pitch)
+            #     在acesinger中，实际很多情况音频比note更长
+            #     '''
+            #     # print(f'debug -- difference {len(pc)-codec_T}')
+            #     if len(pc)-codec_T>20: # pitch_ls too long
+            #         del_length = find_shortest_zero_segment(pc)
+            #         pc = delete_zeros_from_segments(pc, del_length)
+            #     if len(pc)<codec_T:
+            #         updated_pitch = pc + [0] * (codec_T - len(pc)) 
+            #         processed_pitch.append(updated_pitch)        
+            #     elif len(pc)==codec_T:
+            #         processed_pitch.append(pc)
+            #     else:
+            #         updated_pitch = pc[:codec_T]
+            #         processed_pitch.append(updated_pitch)
 
-            # padded to maxpitch in preprocessing
-            pitch_tensors = torch.tensor(processed_pitch)
-            input_batch['pitch'] = pitch_tensors.to(device)
+            # # padded to maxpitch in preprocessing
+            # pitch_tensors = torch.tensor(processed_pitch)
+            # input_batch['pitch'] = pitch_tensors.to(device)
 
+
+            # NOTE(yiwen) update models
             optimizer.zero_grad()
             output_loss_dic = model(input_batch, device)
             
@@ -513,7 +549,7 @@ def train_one_epoch(model,
         # TODO(yiwen) save model (is able to resume on)
         # if epoch_id % 2 ==0:
         if os.path.exists(save_path):
-            os.rename(save_path, './latest_bu_pitch.pth')
+            os.rename(save_path, './latest_bu_pitch3.pth')
         torch.save({
             'epoch': epoch_id,
             'model_state_dict': model.state_dict(),
@@ -611,6 +647,34 @@ def inference(model,
         sf.write(save_name, waveform.T, samplerate=sample_rate)
 
 
+def get_batch_mel_lengths(
+    lengths,
+    n_fft=1024,
+    hop_length=320,
+    win_length=1024,
+    center=True
+):
+    """
+    Compute mel frame lengths for a batch of waveform lengths.
+
+    Args:
+        lengths: list or 1D tensor of waveform lengths (in samples)
+        n_fft: FFT size
+        hop_length: hop size
+        win_length: window size
+        center: whether to pad input (default True, as in torchaudio)
+    Returns:
+        1D tensor of mel frame lengths
+    """
+    import torch
+    if not torch.is_tensor(lengths):
+        lengths = torch.tensor(lengths)
+    pad = n_fft // 2 if center else 0
+    T_padded = lengths + 2 * pad
+    mel_lengths = 1 + torch.clamp((T_padded - win_length) // hop_length, min=0)
+    return mel_lengths
+
+
 if __name__=='__main__':
 
     set_seed(42)
@@ -618,15 +682,13 @@ if __name__=='__main__':
     # TODO(yiwen) larger batch size, more data?
                 # can make only some of them as conditional data, and also do cfg in some portion.
                 # if no supervision, only need waveform
-    # TODO(yiwen) check whether need to provide t in inference 
-                # (because the vector field is time dependent, and dirty distribution is not the orignal source distribution (Gaussian) in training)
     # TODO(yiwen) add some visualization
                 # tSNE, mel spectrogram
     device = "cuda:0"
     valid_step = 10
-    total_epochs = 100
+    total_epochs = 30
 
-    batch_size = 32
+    batch_size = 64
     train = True
     # train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/kising/speechlm1/dump/audio_raw_svs_kising/tr_no_dev/label" # NOTE(yiwen) debugging
     # test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/kising/speechlm1/dump/audio_raw_svs_kising/eval/label"
@@ -634,7 +696,7 @@ if __name__=='__main__':
     test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/test/label"
     output_dir = './output'
 
-    latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/latest_pitch_new.pth"
+    latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/latest_pitch_new3.pth"
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -655,8 +717,10 @@ if __name__=='__main__':
     )
 
     # NOTE(yiwen) temp choice
-    optimizer = torch.optim.AdamW(maskedDiff.parameters(), lr=0.0005, weight_decay=0.0001)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.9)
+    optimizer = torch.optim.AdamW(maskedDiff.parameters(), lr=0.005, weight_decay=0.0001)
+    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.7) 
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[2, 5, 8, 15], gamma=0.3) # 3 
+    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.2) # 2 0.7  5 0.2
 
 
     if train:
@@ -670,13 +734,13 @@ if __name__=='__main__':
 
         # TODO(yiwen) modify the test scproot and label file to train
         train_dataset = TrainDataset(audio_dir="./datasets/wav_dump/",
-                                        scp_root="/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/exp/speechlm_opuslm_v1_1.7B_anneal_ext_phone_finetune_svs/decode_tts_espnet_sampling_temperature0.8_finetune_40epoch/svs_test/log",
-                                        label_file=test_label_file,
+                                        scp_root="/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/exp/speechlm_opuslm_v1_1.7B_anneal_ext_phone_finetune_svs/decode_tts_espnet_sampling_temperature0.8_finetune_68epoch/svs_tr_no_dev/log",
+                                        label_file=train_label_file,
                                         ark_root= "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1",
                                         sample_rate=16000, 
                                         )
 
-        train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=collate_fn)
+        train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, collate_fn=collate_fn)
         pretrain_epoch = 0
 
         if os.path.exists(latest_model_file):
@@ -697,11 +761,16 @@ if __name__=='__main__':
 
     else:
         ### test dataloader (need flatten code, need corresponding pitch)
-        test_dataset = TestDataset(scp_root="/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/exp/speechlm_opuslm_v1_1.7B_anneal_ext_phone_finetune_svs/decode_tts_espnet_sampling_temperature0.8_finetune_20epoch/svs_test/log",
+        test_dataset = TestDataset(scp_root="/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/exp/speechlm_opuslm_v1_1.7B_anneal_ext_phone_finetune_svs/decode_tts_espnet_sampling_temperature0.8_finetune_68epoch/svs_test/log",
                                     label_file=test_label_file,
                                     ark_root= "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1",
                                     sample_rate=16000, 
                                     )
+        # test_dataset = TestDataset(scp_root="/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/exp/speechlm_opuslm_v1_1.7B_anneal_ext_phone_finetune_svs/decode_tts_espnet_sampling_temperature0.8_finetune_68epoch/svs_tr_no_dev/log",
+        #                                 label_file=train_label_file,
+        #                                 ark_root= "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1",
+        #                                 sample_rate=16000, 
+        #                                 )
         # batchsize=1 in inference
         test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=True, num_workers=0, collate_fn=collate_fn_test)
 

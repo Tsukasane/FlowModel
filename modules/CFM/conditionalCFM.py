@@ -152,7 +152,13 @@ class ConditionalCFM(BASECFM):
 
         pred = self.estimator(y, mask, mu, t.squeeze(), spks, cond) # NOTE(yiwen) should be the same shape as u
 
+        ''' - u: B, 1, 80, T
+            - pred: B, out_channel, T
+            - mask: B, 1, T
+        '''
+        pred = pred.unsqueeze(1)
         loss = F.mse_loss(pred * mask, u * mask, reduction="sum") / (torch.sum(mask) * u.shape[1])
+        print(f'debug -- loss {loss}')
         return loss, y
 
 

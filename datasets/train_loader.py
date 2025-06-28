@@ -34,7 +34,7 @@ class TrainDataset(Dataset):
     # TODO(yiwen) add waveform
     def __init__(self, audio_dir, scp_root, label_file, ark_root, sample_rate=16000):
         
-        split_size = 2 # TODO(yiwen) change this to 16
+        split_size = 16 # TODO(yiwen) change this to 16
 
         self.pitch_dict = {}
         self.flattenCode_dict = {}
@@ -47,7 +47,7 @@ class TrainDataset(Dataset):
         self.preprocess_pitch(label_file)
 
 
-        for i in range(split_size):
+        for i in range(split_size): # NOTE(yiwen) temp
             csplit = str(i+1)
             token_file_name = f'output.{csplit}/wav.scp/rank0_token_wav.scp.scp'
             # output.1/label/rank0_token_label.scp
