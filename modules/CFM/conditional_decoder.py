@@ -238,7 +238,6 @@ class ConditionalDecoder(nn.Module):
         hiddens = []
         masks = [mask] # 32, 1, 361
         
-        print(f'progress marker 2')
         # NOTE(yiwen) current unet/transformer blocks didn't take conditions
         for resnet, transformer_blocks, downsample in self.down_blocks:
             mask_down = masks[-1] # # mask_down.shape [32, 1, 347]

@@ -138,7 +138,7 @@ class ConditionalCFM(BASECFM):
         if self.t_scheduler == 'cosine':
             t = 1 - torch.cos(t * 0.5 * torch.pi) # 32, 1, 1
         
-        z = torch.randn_like(x1) # 32, 512, 360 TODO(yiwen) x1 gt 可以改成mel，从noise mel到good mel
+        z = torch.randn_like(x1) # 32, 512, 360 
         y = (1 - (1 - self.sigma_min) * t) * z + t * x1 # position(interpolated distribution) along time
         u = x1 - (1 - self.sigma_min) * z # 32, 512, 360 velocity along time
 
@@ -157,8 +157,9 @@ class ConditionalCFM(BASECFM):
             - mask: B, 1, T
         '''
         pred = pred.unsqueeze(1)
-        loss = F.mse_loss(pred * mask, u * mask, reduction="sum") / (torch.sum(mask) * u.shape[1])
-        print(f'debug -- loss {loss}')
+        loss_scalar = 10e-5
+        loss = loss_scalar * F.mse_loss(pred * mask, u * mask, reduction="sum") / (torch.sum(mask) * u.shape[1])
+        # print(f'debug -- loss {loss}')
         return loss, y
 
 

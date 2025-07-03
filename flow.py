@@ -176,7 +176,6 @@ class MaskedDiff(torch.nn.Module):
         h, _ = self.encoder(token, token_len)
         h, _ = self.length_regulator(h, token_len)  
 
-        print(f'progress marker 1')
         # get conditions
         conds = pitch # pitch
         conds = conds.unsqueeze(-1).to(device).float()
@@ -188,7 +187,7 @@ class MaskedDiff(torch.nn.Module):
             mask=mask.unsqueeze(1),
             spks=None,
             cond=conds,
-            n_timesteps=10
+            n_timesteps=25
         ) # get the feature, then pass to the vocoder
 
         feat = feat.transpose(1,2)
@@ -197,7 +196,7 @@ class MaskedDiff(torch.nn.Module):
         return feat
 
 
-def init_modules(device):
+def init_modules(device, batch_size=32):
 
     # -------- configs -------- #
     class DummyCFMParams:
@@ -229,8 +228,9 @@ def init_modules(device):
 
     codec_model = get_codec_tokenizer(device)
 
+    in_channeldim = batch_size * 80 + 512 # NOTE(yiwen) 1
     decoder_estimator = ConditionalDecoder(
-        in_channels=3072, # NOTE(yiwen) x || cond    1536 for codec embedding
+        in_channels=in_channeldim, # NOTE(yiwen) x || cond    1536 for codec embedding  
         out_channels=80, # NOTE(yiwen) 512 for codec embedding
         channels=[256, 256],
         dropout=0.0,
@@ -486,6 +486,8 @@ def train_one_epoch(model,
             
             input_batch['mel_spectrogram'] = mel_modified
             input_batch['source_codec_feats'] = input_batch['source_codec_feats']
+            
+
             # print(f'debug -- codec_source_T {max_code_length}; codec_T {codec_T}') # difference is less than 10 frames
             # codec_min_length = codec_T # min(max_code_length, input_batch['codec_continuous_feats'].shape[1])
             # input_batch['mel_spectrogram'] = input_batch['mel_spectrogram'][:,:,:,:mel_min_length] # B, 1, 80, mellength
@@ -701,7 +703,7 @@ if __name__=='__main__':
     os.makedirs(output_dir, exist_ok=True)
 
     # ------ load models ------ #
-    encoder, length_regulator, decoder, codec_model = init_modules(device) # already loaded to the device
+    encoder, length_regulator, decoder, codec_model = init_modules(device, batch_size) # already loaded to the device
     maskedDiff = MaskedDiff(
         encoder=encoder,
         length_regulator=length_regulator,
@@ -717,9 +719,9 @@ if __name__=='__main__':
     )
 
     # NOTE(yiwen) temp choice
-    optimizer = torch.optim.AdamW(maskedDiff.parameters(), lr=0.005, weight_decay=0.0001)
+    optimizer = torch.optim.AdamW(maskedDiff.parameters(), lr=0.0001, weight_decay=0.0001)
     # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.7) 
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[2, 5, 8, 15], gamma=0.3) # 3 
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[2, 5, 15], gamma=0.2)
     # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.2) # 2 0.7  5 0.2
 
 
@@ -737,10 +739,10 @@ if __name__=='__main__':
                                         scp_root="/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/exp/speechlm_opuslm_v1_1.7B_anneal_ext_phone_finetune_svs/decode_tts_espnet_sampling_temperature0.8_finetune_68epoch/svs_tr_no_dev/log",
                                         label_file=train_label_file,
                                         ark_root= "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1",
-                                        sample_rate=16000, 
+                                        sample_rate=16000
                                         )
 
-        train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, collate_fn=collate_fn)
+        train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, collate_fn=collate_fn, drop_last=True,) # NOTE(yiwen) align batch with in_channel at flow.py NOTE 1
         pretrain_epoch = 0
 
         if os.path.exists(latest_model_file):
