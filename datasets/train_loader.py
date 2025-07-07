@@ -31,7 +31,6 @@ def extract_pitch_alongtime(line):
 
 
 class TrainDataset(Dataset):
-    # TODO(yiwen) add waveform
     def __init__(self, audio_dir, scp_root, label_file, ark_root, sample_rate=16000):
         
         split_size = 16 # TODO(yiwen) change this to 16

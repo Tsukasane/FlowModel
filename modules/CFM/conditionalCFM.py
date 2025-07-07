@@ -34,7 +34,7 @@ class ConditionalCFM(BASECFM):
         """Forward diffusion
 
         Args:
-            mu (torch.Tensor): output of encoder NOTE(yiwen) first pass the original waveform to the encoder
+            mu (torch.Tensor): output of encoder
                 shape: (batch_size, n_feats, mel_timesteps) e.g. 2, 80, 50
             mask (torch.Tensor): output_mask
                 shape: (batch_size, 1, mel_timesteps) e.g. 2, 1, 50
@@ -48,7 +48,7 @@ class ConditionalCFM(BASECFM):
             sample: generated mel-spectrogram
                 shape: (batch_size, n_feats, mel_timesteps)
         """
-        z = torch.randn_like(mu) * temperature
+        z = torch.randn_like(mu) * temperature #TODO(yiwen) check here, cond is codec embeding, same T' but different C as mel
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
         if self.t_scheduler == 'cosine':
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
@@ -151,14 +151,13 @@ class ConditionalCFM(BASECFM):
                 cond = cond * cfg_mask.view(-1, 1, 1)
 
         pred = self.estimator(y, mask, mu, t.squeeze(), spks, cond) # NOTE(yiwen) should be the same shape as u
-
+        
         ''' - u: B, 1, 80, T
             - pred: B, out_channel, T
             - mask: B, 1, T
         '''
-        pred = pred.unsqueeze(1)
-        loss_scalar = 10e-5
-        loss = loss_scalar * F.mse_loss(pred * mask, u * mask, reduction="sum") / (torch.sum(mask) * u.shape[1])
+        # pred = pred.unsqueeze(1)
+        loss = F.mse_loss(pred * mask, u * mask, reduction="mean")
         # print(f'debug -- loss {loss}')
         return loss, y
 

@@ -41,6 +41,8 @@ import logging
 logging.basicConfig(level=logging.INFO)
 
 from torch.utils.tensorboard import SummaryWriter
+
+import matplotlib.pyplot as plt
 import numpy as np
 
 
@@ -120,7 +122,8 @@ class MaskedDiff(torch.nn.Module):
         """
 
         # codec_continuous_feats = batch['codec_continuous_feats']  # 32, 349, 512
-        mel_spectrogram = batch['mel_spectrogram'] 
+        mel_spectrogram = batch['mel_spectrogram'].squeeze(1) # B, 1, 80, T' --> B, 80, T'
+
         codec_token_len = batch['codec_feats_len']
         # pitch = batch['pitch']
         source_codec_feats = batch['source_codec_feats']
@@ -151,13 +154,11 @@ class MaskedDiff(torch.nn.Module):
             conds = self.linear_cond_pitch(conds).transpose(1,2)
 
         loss, _ = self.decoder.compute_loss( 
-                # codec_continuous_feats.transpose(1,2), # the target for flow
-                mel_spectrogram,
-                mask.unsqueeze(1),
-                h.transpose(1, 2).contiguous(), # the encoder output (latent)
-                None,
-                cond=conds
-        )
+                x1=mel_spectrogram, # target
+                mask=mask.unsqueeze(1), # mask
+                mu=h.transpose(1, 2).contiguous(), # the encoder output (latent)
+                spks=None,
+                cond=conds,)
 
         return {'loss': loss}
 
@@ -166,8 +167,12 @@ class MaskedDiff(torch.nn.Module):
                   token,
                   token_len,
                   sample_rate,
-                  pitch,
+                  pitch=None,
                   device='cuda:0'):
+        """
+        Args:
+            - h: the encoded noisy codec condition
+        """
         assert token.shape[0] == 1
 
         # flatten_code_embedding, lengths, pitch
@@ -177,17 +182,19 @@ class MaskedDiff(torch.nn.Module):
         h, _ = self.length_regulator(h, token_len)  
 
         # get conditions
-        conds = pitch # pitch
-        conds = conds.unsqueeze(-1).to(device).float()
-        conds = self.linear_cond_pitch(conds).transpose(1,2)
+        conds = None # pitch
+        if conds:
+            conds = conds.unsqueeze(-1).to(device).float()
+            conds = self.linear_cond_pitch(conds).transpose(1,2)
 
         mask = (~make_pad_mask(token_len)).to(h)
-        feat = self.decoder( # NOTE(yiwen) if not directly the source dis, pass t?
+
+        feat = self.decoder( # NOTE(yiwen) the output is in the same shape as mu
             mu=h.transpose(1, 2).contiguous(), # the input is the source codec token embedding
             mask=mask.unsqueeze(1),
             spks=None,
             cond=conds,
-            n_timesteps=25
+            n_timesteps=10 # 25
         ) # get the feature, then pass to the vocoder
 
         feat = feat.transpose(1,2)
@@ -228,7 +235,7 @@ def init_modules(device, batch_size=32):
 
     codec_model = get_codec_tokenizer(device)
 
-    in_channeldim = batch_size * 80 + 512 # NOTE(yiwen) 1
+    in_channeldim = 80 + 512 # NOTE(yiwen) 1 TODO 这里有问题, x应该是targetshape，dim80，mu是encoderout，dim512，bs的处理也不太对
     decoder_estimator = ConditionalDecoder(
         in_channels=in_channeldim, # NOTE(yiwen) x || cond    1536 for codec embedding  
         out_channels=80, # NOTE(yiwen) 512 for codec embedding
@@ -292,12 +299,12 @@ def waveform_to_mel(
         power=2.0,
     ).to(device)
 
-    db_transform = T.AmplitudeToDB(stype="power").to(device)
+    db_transform = T.AmplitudeToDB(stype="power").to(device) # this operation causes -100
 
-    mel_spec = mel_spec_transform(waveform)  # (1, n_mels, T')
-    log_mel_spec = db_transform(mel_spec)    # (1, n_mels, T')
-
-    return log_mel_spec.squeeze(0)  # (n_mels, T')
+    mel_spec = mel_spec_transform(waveform)  # (B, 1, n_mels, T')
+    log_mel_spec = db_transform(mel_spec)    # (B, 1, n_mels, T')
+    
+    return log_mel_spec.squeeze(0)  # (B, n_mels, T')
 
 
 def delete_zeros_from_segments(lst, num_to_delete=1):
@@ -412,6 +419,20 @@ def get_codec(codec_model, waveform, length):
     return batch
 
 
+def visualize_mel(log_mel_spec, save_name):
+    # B, 1, 80, T'
+    mel = log_mel_spec[0][0].cpu().numpy()  # 取第一个样本，去掉 batch 和 channel
+
+    plt.figure(figsize=(10, 4))
+    plt.imshow(mel, origin='lower', aspect='auto', cmap='magma')
+    plt.title("Log-Mel Spectrogram")
+    plt.xlabel("Time")
+    plt.ylabel("Mel Frequency Bin")
+    plt.colorbar(format="%+2.0f dB")
+    plt.tight_layout()
+    plt.savefig(save_name)
+    plt.close()
+
 def train_one_epoch(model, 
                     optimizer, 
                     scheduler, 
@@ -422,7 +443,7 @@ def train_one_epoch(model,
                     codec_per_frame=8,
                     ssl_per_frame=1,
                     embedding_dim=512,
-                    save_path='./latest_pitch_new3.pth'):
+                    save_path='./debug_l.pth'):
         ''' Train one epoch
         Args:
             - flatten_token: noisy codec token
@@ -442,6 +463,8 @@ def train_one_epoch(model,
         codec_model.eval()
         token_per_frame = codec_per_frame + ssl_per_frame
 
+        vis_mel = True # visualize the first element at the start of each epoch
+
         for flatten_token, batch_waveforms, lengths_waveform, lengths_code, filenames, pitch in train_data_loader:
             num_batch += 1
             input_batch = {}
@@ -451,6 +474,7 @@ def train_one_epoch(model,
             flatten_code_embeddingls = []
             code_length_all = []
             max_code_length = 0
+
             with torch.no_grad():
                 for i, fc in enumerate(flatten_token):
                     fc = fc.to(device).to(int) # already in range of codec, no padding, in shape [1, 1352]
@@ -461,7 +485,7 @@ def train_one_epoch(model,
                     flatten_code_embeddingls.append(flatten_code_embedding)
             input_batch['codec_feats_len'] = torch.tensor(code_length_all).to(device) # valid continous codec embedding length for all elements in one batch
 
-            # unify the length of the condition (noisy codec embeddings)
+            # NOTE unify the length of the condition (noisy codec embeddings)
             padded_flatten_code = torch.zeros(len(flatten_token), max_code_length, embedding_dim)
             for i, fc in enumerate(flatten_code_embeddingls):
                 padded_flatten_code[i:i+1, :fc.shape[1],:] = fc
@@ -471,11 +495,13 @@ def train_one_epoch(model,
             
             # NOTE GET TARGET: clean waveform to mel-spectrogram
             batch_waveforms = batch_waveforms.to(device) # 32, 1, 116718
-            # input_batch = get_codec(codec_model, batch_waveforms, lengths_waveform) # target codec embedding
-            # codec_T = input_batch['codec_continuous_feats'].shape[1] # clean code T
             input_batch['mel_spectrogram'] = waveform_to_mel(batch_waveforms, device=device) # batchMEL
             mel_T = get_batch_mel_lengths(lengths_waveform) # a list, mel T length of each waveform sample in a batch
             mel_max_length = mel_T.max().item()
+
+            if vis_mel:
+                visualize_mel(input_batch['mel_spectrogram'], f"GT_mel{num_batch}.png")
+                vis_mel=False
 
             # NOTE align target (B, 1, 80, T) to source (B, T, 512)
             B, T = input_batch['source_codec_feats'].shape[0], input_batch['source_codec_feats'].shape[1]
@@ -487,16 +513,6 @@ def train_one_epoch(model,
             input_batch['mel_spectrogram'] = mel_modified
             input_batch['source_codec_feats'] = input_batch['source_codec_feats']
             
-
-            # print(f'debug -- codec_source_T {max_code_length}; codec_T {codec_T}') # difference is less than 10 frames
-            # codec_min_length = codec_T # min(max_code_length, input_batch['codec_continuous_feats'].shape[1])
-            # input_batch['mel_spectrogram'] = input_batch['mel_spectrogram'][:,:,:,:mel_min_length] # B, 1, 80, mellength
-
-            # input_batch['codec_continuous_feats'] = input_batch['codec_continuous_feats'][:,:codec_min_length,:]
-
-
-            # input_batch['codec_feats_len'] = mel_T
-
             # TODO(yiwen) think about other conditions as well
             processed_pitch = []
 
@@ -551,7 +567,7 @@ def train_one_epoch(model,
         # TODO(yiwen) save model (is able to resume on)
         # if epoch_id % 2 ==0:
         if os.path.exists(save_path):
-            os.rename(save_path, './latest_bu_pitch3.pth')
+            os.rename(save_path, './debug_b.pth')
         torch.save({
             'epoch': epoch_id,
             'model_state_dict': model.state_dict(),
@@ -620,29 +636,30 @@ def inference(model,
         processed_pitch = []
 
         # NOTE(yiwen) better pitch alignment in inference
-        for pc in pitch:
-            '''
-            if pitch ls too short, do padding
-            if pitch ls too long, del zero first (each segment del min 0 segment length)
-                then assume redundant zeros are all at the tail, cut them
-            '''
-            if len(pc)-codec_T>20: # pitch_ls too long
-                del_length = find_shortest_zero_segment(pc)
-                pc = delete_zeros_from_segments(pc, del_length)
-            if len(pc)<codec_T:
-                updated_pitch = pc + [0] * (codec_T - len(pc)) 
-                processed_pitch.append(updated_pitch)        
-            elif len(pc)==codec_T:
-                processed_pitch.append(pc)
-            else:
-                updated_pitch = pc[:codec_T]
-                processed_pitch.append(updated_pitch)
-        pitch_tensors = torch.tensor(processed_pitch)
+        # for pc in pitch:
+        #     '''
+        #     if pitch ls too short, do padding
+        #     if pitch ls too long, del zero first (each segment del min 0 segment length)
+        #         then assume redundant zeros are all at the tail, cut them
+        #     '''
+        #     if len(pc)-codec_T>20: # pitch_ls too long
+        #         del_length = find_shortest_zero_segment(pc)
+        #         pc = delete_zeros_from_segments(pc, del_length)
+        #     if len(pc)<codec_T:
+        #         updated_pitch = pc + [0] * (codec_T - len(pc)) 
+        #         processed_pitch.append(updated_pitch)        
+        #     elif len(pc)==codec_T:
+        #         processed_pitch.append(pc)
+        #     else:
+        #         updated_pitch = pc[:codec_T]
+        #         processed_pitch.append(updated_pitch)
+        # pitch_tensors = torch.tensor(processed_pitch)
         
-        output_feats = model.inference(flatten_code_embedding, lengths, sample_rate, pitch_tensors)
+        # TODO(yiwen) this should be mel
+        output_feats = model.inference(flatten_code_embedding, lengths, sample_rate)
 
-        with torch.no_grad():
-            waveform = codec_model.decode_continuous(output_feats).squeeze(1).cpu().numpy()
+        # with torch.no_grad():
+        #     waveform = codec_model.decode_continuous(output_feats).squeeze(1).cpu().numpy()
             # waveform = codec_model.decode_continuous(flatten_code_embedding).squeeze(1).cpu().numpy() # debug, decode the original codec embedding
 
         save_name = os.path.join(output_dir, f'save_{filenames[0]}.wav')
@@ -690,7 +707,7 @@ if __name__=='__main__':
     valid_step = 10
     total_epochs = 30
 
-    batch_size = 64
+    batch_size = 32
     train = True
     # train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/kising/speechlm1/dump/audio_raw_svs_kising/tr_no_dev/label" # NOTE(yiwen) debugging
     # test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/kising/speechlm1/dump/audio_raw_svs_kising/eval/label"
@@ -698,7 +715,7 @@ if __name__=='__main__':
     test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/test/label"
     output_dir = './output'
 
-    latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/latest_pitch_new3.pth"
+    latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/debug_l.pth"
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -719,7 +736,7 @@ if __name__=='__main__':
     )
 
     # NOTE(yiwen) temp choice
-    optimizer = torch.optim.AdamW(maskedDiff.parameters(), lr=0.0001, weight_decay=0.0001)
+    optimizer = torch.optim.AdamW(maskedDiff.parameters(), lr=0.00001, weight_decay=0.00001)
     # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.7) 
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[2, 5, 15], gamma=0.2)
     # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.2) # 2 0.7  5 0.2

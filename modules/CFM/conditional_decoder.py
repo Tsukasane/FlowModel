@@ -223,11 +223,8 @@ class ConditionalDecoder(nn.Module):
         t = self.time_embeddings(t).to(t.dtype) # 32 --> 32, 1024
         t = self.time_mlp(t) # 32, 1024 --> 32, 1024
 
-        # if x.shape[1]!=mu.shape[1]: # mu.shape[1] is fixed to 512
-        #     x = self.linear_input_project(x.transpose(1,2)).transpose(1,2) # NOTE(yiwen) add this temporaly
-
         x = pack([x, mu], "b * t")[0] # 32, 512, 357 --> 32, 1024, 357 distribution along probability path || clean condition TODO(yiwen)把x和encoder output pack起来有什么意义吗
-
+        # TEMP 1, 512, 169
         if spks is not None:
             spks = repeat(spks, "b c -> b c t", t=x.shape[-1])
             x = pack([x, spks], "b * t")[0]
@@ -286,7 +283,7 @@ class ConditionalDecoder(nn.Module):
                 )
             x = rearrange(x, "b t c -> b c t").contiguous()
             x = upsample(x * mask_up)
-        x = self.final_block(x, mask_up) # 32, 256, 381
+        x = self.final_block(x, mask_up)
 
         output = self.final_proj(x * mask_up)
         # output = self.linear_output_project(output.transpose(1,2)).transpose(1,2) # 32, 80, 358
