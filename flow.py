@@ -420,7 +420,10 @@ def get_codec(codec_model, waveform, length):
 
 
 def visualize_mel(log_mel_spec, save_name):
-    # B, 1, 80, T'
+    '''
+    Args: B, 1, 80, T'
+    '''
+
     mel = log_mel_spec[0][0].cpu().numpy()  # 取第一个样本，去掉 batch 和 channel
 
     plt.figure(figsize=(10, 4))
@@ -443,7 +446,7 @@ def train_one_epoch(model,
                     codec_per_frame=8,
                     ssl_per_frame=1,
                     embedding_dim=512,
-                    save_path='./debug_l.pth'):
+                    save_path='./debug_para2_l.pth'):
         ''' Train one epoch
         Args:
             - flatten_token: noisy codec token
@@ -567,7 +570,7 @@ def train_one_epoch(model,
         # TODO(yiwen) save model (is able to resume on)
         # if epoch_id % 2 ==0:
         if os.path.exists(save_path):
-            os.rename(save_path, './debug_b.pth')
+            os.rename(save_path, './debug_para2_b.pth')
         torch.save({
             'epoch': epoch_id,
             'model_state_dict': model.state_dict(),
@@ -657,13 +660,15 @@ def inference(model,
         
         # TODO(yiwen) this should be mel
         output_feats = model.inference(flatten_code_embedding, lengths, sample_rate)
+        output_feats = output_feats.transpose(-1,-2).unsqueeze(1)
 
+        visualize_mel(output_feats, "Pred_mel.png")
+        # decode codec embedding to waveform
         # with torch.no_grad():
         #     waveform = codec_model.decode_continuous(output_feats).squeeze(1).cpu().numpy()
             # waveform = codec_model.decode_continuous(flatten_code_embedding).squeeze(1).cpu().numpy() # debug, decode the original codec embedding
-
-        save_name = os.path.join(output_dir, f'save_{filenames[0]}.wav')
-        sf.write(save_name, waveform.T, samplerate=sample_rate)
+        # save_name = os.path.join(output_dir, f'save_{filenames[0]}.wav')
+        # sf.write(save_name, waveform.T, samplerate=sample_rate)
 
 
 def get_batch_mel_lengths(
@@ -707,7 +712,7 @@ if __name__=='__main__':
     valid_step = 10
     total_epochs = 30
 
-    batch_size = 32
+    batch_size = 64
     train = True
     # train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/kising/speechlm1/dump/audio_raw_svs_kising/tr_no_dev/label" # NOTE(yiwen) debugging
     # test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/kising/speechlm1/dump/audio_raw_svs_kising/eval/label"
@@ -715,7 +720,7 @@ if __name__=='__main__':
     test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/test/label"
     output_dir = './output'
 
-    latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/debug_l.pth"
+    latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/debug_para2_l.pth"
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -738,7 +743,7 @@ if __name__=='__main__':
     # NOTE(yiwen) temp choice
     optimizer = torch.optim.AdamW(maskedDiff.parameters(), lr=0.00001, weight_decay=0.00001)
     # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.7) 
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[2, 5, 15], gamma=0.2)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[2, 5, 10, 18], gamma=0.2)
     # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.2) # 2 0.7  5 0.2
 
 

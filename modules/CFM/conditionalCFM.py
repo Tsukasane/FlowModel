@@ -48,7 +48,10 @@ class ConditionalCFM(BASECFM):
             sample: generated mel-spectrogram
                 shape: (batch_size, n_feats, mel_timesteps)
         """
-        z = torch.randn_like(mu) * temperature #TODO(yiwen) check here, cond is codec embeding, same T' but different C as mel
+        B, C, T = mu.shape  # mu.shape = (B, 512, T‘)
+        z = torch.randn(B, 80, T, device=mu.device, dtype=mu.dtype) * temperature
+
+        # z = torch.randn_like(mu) * temperature #TODO(yiwen) check here, cond is codec embeding, same T' but different C as mel
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
         if self.t_scheduler == 'cosine':
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
@@ -152,9 +155,10 @@ class ConditionalCFM(BASECFM):
 
         pred = self.estimator(y, mask, mu, t.squeeze(), spks, cond) # NOTE(yiwen) should be the same shape as u
         
-        ''' - u: B, 1, 80, T
-            - pred: B, out_channel, T
-            - mask: B, 1, T
+        '''
+        - u: B, 1, 80, T
+        - pred: B, out_channel, T
+        - mask: B, 1, T
         '''
         # pred = pred.unsqueeze(1)
         loss = F.mse_loss(pred * mask, u * mask, reduction="mean")
