@@ -8,6 +8,7 @@ source path.sh
 
 ```
 
-以mel作为target的flow loss不太降
-run inference
-check mel spectrogram in inference
+
+## TODO
+- [ ] tune params
+- [ ] check pretrained vocoder / domain specific vocoder
