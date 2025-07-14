@@ -46,6 +46,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+def lr_lambda(step):
+    if step < start_decay:
+        return 1.0
+    elif step < end_decay:
+        return 1.0 - (step - start_decay) / (end_decay - start_decay) * (1 - final_lr / initial_lr)
+    else:
+        return final_lr / initial_lr
+
+
 def set_seed(seed=42):
     # Python built-in random
     random.seed(seed)
@@ -446,7 +455,7 @@ def train_one_epoch(model,
                     codec_per_frame=8,
                     ssl_per_frame=1,
                     embedding_dim=512,
-                    save_path='./debug_para2_l.pth'):
+                    save_path='./debug_new_l.pth'):
         ''' Train one epoch
         Args:
             - flatten_token: noisy codec token
@@ -562,7 +571,7 @@ def train_one_epoch(model,
             batch_loss.backward()
             optimizer.step()
         
-        scheduler.step()
+            scheduler.step()
 
         total_loss /= num_batch
         logging.info(f'Training Loss for Epoch {epoch_id}: {total_loss}')
@@ -570,7 +579,7 @@ def train_one_epoch(model,
         # TODO(yiwen) save model (is able to resume on)
         # if epoch_id % 2 ==0:
         if os.path.exists(save_path):
-            os.rename(save_path, './debug_para2_b.pth')
+            os.rename(save_path, './debug_new_b.pth')
         torch.save({
             'epoch': epoch_id,
             'model_state_dict': model.state_dict(),
@@ -610,7 +619,7 @@ def inference(model,
               codec_per_frame=8,
               ssl_per_frame=1,
               sample_rate=16000,
-              output_dir='./output'): 
+              output_dir='./output_new'): 
     '''
     Inputs:
         - pitch(list): as condition
@@ -663,6 +672,9 @@ def inference(model,
         output_feats = output_feats.transpose(-1,-2).unsqueeze(1)
 
         visualize_mel(output_feats, "Pred_mel.png")
+
+        import pdb
+        pdb.set_trace()
         # decode codec embedding to waveform
         # with torch.no_grad():
         #     waveform = codec_model.decode_continuous(output_feats).squeeze(1).cpu().numpy()
@@ -703,9 +715,7 @@ if __name__=='__main__':
 
     set_seed(42)
 
-    # TODO(yiwen) larger batch size, more data?
-                # can make only some of them as conditional data, and also do cfg in some portion.
-                # if no supervision, only need waveform
+    # TODO(yiwen) other conditions like spkprompt
     # TODO(yiwen) add some visualization
                 # tSNE, mel spectrogram
     device = "cuda:0"
@@ -718,11 +728,16 @@ if __name__=='__main__':
     # test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/kising/speechlm1/dump/audio_raw_svs_kising/eval/label"
     train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/tr_no_dev/label" # NOTE(yiwen) debugging
     test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/test/label"
-    output_dir = './output'
+    output_dir = './output_new'
 
-    latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/debug_para2_l.pth"
+    latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/debug_new_l.pth"
 
     os.makedirs(output_dir, exist_ok=True)
+
+    initial_lr = 3e-4
+    final_lr = 1e-4
+    start_decay = 200_000
+    end_decay = 500_000
 
     # ------ load models ------ #
     encoder, length_regulator, decoder, codec_model = init_modules(device, batch_size) # already loaded to the device
@@ -741,10 +756,8 @@ if __name__=='__main__':
     )
 
     # NOTE(yiwen) temp choice
-    optimizer = torch.optim.AdamW(maskedDiff.parameters(), lr=0.00001, weight_decay=0.00001)
-    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.7) 
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[2, 5, 10, 18], gamma=0.2)
-    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.2) # 2 0.7  5 0.2
+    optimizer = torch.optim.AdamW(maskedDiff.parameters(), lr=initial_lr)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
     if train:
