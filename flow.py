@@ -44,6 +44,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torchaudio
 
 
 def lr_lambda(step):
@@ -244,7 +245,7 @@ def init_modules(device, batch_size=32):
 
     codec_model = get_codec_tokenizer(device)
 
-    in_channeldim = 80 + 512 # NOTE(yiwen) 1 TODO 这里有问题, x应该是targetshape，dim80，mu是encoderout，dim512，bs的处理也不太对
+    in_channeldim = 80 + 512
     decoder_estimator = ConditionalDecoder(
         in_channels=in_channeldim, # NOTE(yiwen) x || cond    1536 for codec embedding  
         out_channels=80, # NOTE(yiwen) 512 for codec embedding
@@ -612,10 +613,23 @@ def valid(valid_data_loader):
     pass
 
 
+def save_h5(feats):
+    '''
+    feats: 80, T
+    '''
+    feats = feats.transpose(0,1).detach().cpu().numpy()
+    import h5py
+    with h5py.File("output_feature.h5", "w") as f:
+        f.create_dataset("feats", data=feats)
+    print("Saved to output_feature.h5")
+
+
 def inference(model,
               dataloader,
               codec_model,
               device='cpu',
+              vocoder=None,
+              vocoder_name="hifigan",
               codec_per_frame=8,
               ssl_per_frame=1,
               sample_rate=16000,
@@ -637,10 +651,11 @@ def inference(model,
         flatten_codec = flatten_token.to(device).to(int) # already in range of codec, no padding, in shape [1, 1352]
         lengths = lengths.to(device)
 
+        print(f"debug -- filenames {filenames}")
         with torch.no_grad():
             flatten_code_embedding = codec_model.detokenize(flatten_codec.to(int)).transpose(1, 2) # 1, 159, 512
         
-        print(f'debug -- flatten_code_embedding.shape {flatten_code_embedding.shape}')
+        # print(f'debug -- flatten_code_embedding.shape {flatten_code_embedding.shape}')
         # valid flatten length --> valid codec embedding
         lengths = lengths // 8 # code_per_frame
         
@@ -671,7 +686,23 @@ def inference(model,
         output_feats = model.inference(flatten_code_embedding, lengths, sample_rate)
         output_feats = output_feats.transpose(-1,-2).unsqueeze(1)
 
-        visualize_mel(output_feats, "Pred_mel.png")
+        visualize_mel(output_feats, "Pred_mel.png") # B, 1, T', 80
+        
+        save_feats = output_feats.squeeze()
+        save_h5(save_feats)
+
+        if vocoder_name == "hifigan":
+            waveforms = vocoder.decode_batch(output_feats[0]) # the first in the batch
+            print(f'debug -- waveforms.shape {waveforms.shape}')
+
+        elif vocoder_name == "bigvgan":
+            # generate waveform from mel
+            with torch.inference_mode():
+                wav_gen = vocoder(output_feats[0]) # wav_gen is FloatTensor with shape [B(1), 1, T_time] and values in [-1, 1]
+            waveforms = wav_gen.squeeze(0).cpu() # wav_gen is FloatTensor with shape [1, T_time]
+        
+        torchaudio.save('waveform_reconstructed.wav', waveforms.squeeze(1), 16000)
+
 
         import pdb
         pdb.set_trace()
@@ -682,6 +713,29 @@ def inference(model,
         # save_name = os.path.join(output_dir, f'save_{filenames[0]}.wav')
         # sf.write(save_name, waveform.T, samplerate=sample_rate)
 
+
+def load_vocoder(device, model_name="hifigan"):
+    if model_name == "hifigan":
+        from speechbrain.inference.vocoders import HIFIGAN
+        vocoder = HIFIGAN.from_hparams(source="speechbrain/tts-hifigan-libritts-16kHz", savedir="pretrained_models/tts-hifigan-libritts-16kHz")
+    
+    elif model_name == "bigvgan":
+        import sys
+        bigvgan_root = "/ocean/projects/cis210027p/yzhao16/BigVGAN/BigVGAN"
+        if bigvgan_root not in sys.path:
+            sys.path.insert(0, bigvgan_root)
+
+        import bigvgan
+        import librosa
+
+        # the pretrained mel channel=100, sr=24khz
+        model = bigvgan.BigVGAN.from_pretrained('/ocean/projects/cis210027p/yzhao16/BigVGAN/bigvgan_v2_24khz_100band_256x', use_cuda_kernel=False)
+
+        # remove weight norm in the model and set to eval mode
+        model.remove_weight_norm()
+        vocoder = model.eval().to(device)
+
+    return vocoder
 
 def get_batch_mel_lengths(
     lengths,
@@ -723,7 +777,7 @@ if __name__=='__main__':
     total_epochs = 30
 
     batch_size = 64
-    train = True
+    train = False
     # train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/kising/speechlm1/dump/audio_raw_svs_kising/tr_no_dev/label" # NOTE(yiwen) debugging
     # test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/kising/speechlm1/dump/audio_raw_svs_kising/eval/label"
     train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/tr_no_dev/label" # NOTE(yiwen) debugging
@@ -738,6 +792,8 @@ if __name__=='__main__':
     final_lr = 1e-4
     start_decay = 200_000
     end_decay = 500_000
+
+    vocoder_name = "hifigan"
 
     # ------ load models ------ #
     encoder, length_regulator, decoder, codec_model = init_modules(device, batch_size) # already loaded to the device
@@ -817,6 +873,8 @@ if __name__=='__main__':
         epoch = checkpoint['epoch']
         loss = checkpoint['loss']
 
+        vocoder = load_vocoder(device, model_name=vocoder_name)
+
         maskedDiff.eval()
-        inference(maskedDiff, test_dataloader, codec_model, device)
+        inference(maskedDiff, test_dataloader, codec_model, device, vocoder, vocoder_name)
 
