@@ -126,7 +126,7 @@ class MaskedDiff(torch.nn.Module):
             - batch:
                 - codec_continuous_feats: clean codec embedding
                 - codec_feats_len: length of clean codec embedding
-                - pitch: pitch
+                - pitch: pitch B, T
                 - source_codec_feats: noisy codec embedding B, T, D
                 - mel_spectrogram: mel-spectrogram
         """
@@ -135,7 +135,7 @@ class MaskedDiff(torch.nn.Module):
         mel_spectrogram = batch['mel_spectrogram'].squeeze(1) # B, 1, 80, T' --> B, 80, T'
 
         codec_token_len = batch['codec_feats_len']
-        # pitch = batch['pitch']
+        pitch = batch['pitch']
         source_codec_feats = batch['source_codec_feats']
 
         h, h_lengths = self.encoder(source_codec_feats, codec_token_len) # in_features=512   32, 349, 512,    32, 1, 349 bool according to codec token len
@@ -154,14 +154,16 @@ class MaskedDiff(torch.nn.Module):
         #     conds = None
 
         # conds is directly cat to x
-        # TODO(yiwen) stretch the pitch according to codec_token_len (different among samples in a batch)
-        # conds = pitch # B, T
-        conds = None
-
         mask = (~make_pad_mask(codec_token_len)).to(h) # TODO(yiwen) check the meaning of .to(h1)
-        if conds:
-            conds = conds.unsqueeze(-1).to(device).float()
-            conds = self.linear_cond_pitch(conds).transpose(1,2)
+
+        # conds = None
+        conds = pitch
+        conds = conds.unsqueeze(-1).to(device).float()
+        conds = self.linear_cond_pitch(conds).transpose(1,2)
+
+        if conds.shape[2] != h.shape[1]:
+            logging.warning(f"conds shape {conds.shape} does not match h shape {h.shape}, conds will be resized")
+            conds = F.interpolate(conds, size=h.shape[1], mode='linear', align_corners=False)
 
         loss, _ = self.decoder.compute_loss( 
                 x1=mel_spectrogram, # target
@@ -192,10 +194,14 @@ class MaskedDiff(torch.nn.Module):
         h, _ = self.length_regulator(h, token_len)  
 
         # get conditions
-        conds = None # pitch
-        if conds:
-            conds = conds.unsqueeze(-1).to(device).float()
-            conds = self.linear_cond_pitch(conds).transpose(1,2)
+        # conds = None
+        conds = pitch
+        conds = conds.unsqueeze(-1).to(device).float()
+        conds = self.linear_cond_pitch(conds).transpose(1,2)
+
+        if conds.shape[2] != h.shape[1]:
+            logging.warning(f"conds shape {conds.shape} does not match h shape {h.shape}, conds will be resized")
+            conds = F.interpolate(conds, size=h.shape[1], mode='linear', align_corners=False)
 
         mask = (~make_pad_mask(token_len)).to(h)
 
@@ -245,7 +251,8 @@ def init_modules(device, batch_size=32):
 
     codec_model = get_codec_tokenizer(device)
 
-    in_channeldim = 80 + 512
+    cond_channel = 512
+    in_channeldim = 80 + 512 + cond_channel # mel + codec + pitch
     decoder_estimator = ConditionalDecoder(
         in_channels=in_channeldim, # NOTE(yiwen) x || cond    1536 for codec embedding  
         out_channels=80, # NOTE(yiwen) 512 for codec embedding
@@ -357,22 +364,7 @@ def find_shortest_zero_segment(lst):
         return min_len
     else:
         return -1
-    
 
-# def collate_fn(batch):
-#     # padding to max length in a batch
-#     waveforms = [item['waveform'] for item in batch]
-#     lengths = torch.tensor([item['length'] for item in batch])
-#     filenames = [item['filename'] for item in batch]
-#     pitchs = [item['pitch'] for item in batch]
-
-#     max_len = max(lengths)
-
-#     padded_waveforms = torch.zeros(len(waveforms), 1, max_len)
-#     for i, w in enumerate(waveforms):
-#         padded_waveforms[i, :, :w.shape[1]] = w
-
-#     return padded_waveforms, lengths, filenames, pitchs
 
 def collate_fn(batch):
     waveforms = [item['waveform'] for item in batch]
@@ -433,7 +425,6 @@ def visualize_mel(log_mel_spec, save_name):
     '''
     Args: B, 1, 80, T'
     '''
-
     mel = log_mel_spec[0][0].cpu().numpy()  # 取第一个样本，去掉 batch 和 channel
 
     plt.figure(figsize=(10, 4))
@@ -456,7 +447,7 @@ def train_one_epoch(model,
                     codec_per_frame=8,
                     ssl_per_frame=1,
                     embedding_dim=512,
-                    save_path='./debug_new_l.pth'):
+                    save_path='./addcond_new_l.pth'):
         ''' Train one epoch
         Args:
             - flatten_token: noisy codec token
@@ -530,31 +521,31 @@ def train_one_epoch(model,
             processed_pitch = []
 
             # NOTE(yiwen) temp do not use pitch
-            # for pc in pitch:
-            #     '''
-            #     NOTE(yiwen) basicly aligned, super long song / short phn / round in duration may cause mismatch
-            #     if pitch ls too short, do padding
-            #     if pitch ls too long, del zero first (each segment del min 0 segment length)
-            #         then assume redundant zeros are all at the tail, cut them
+            for pc in pitch:
+                '''
+                NOTE(yiwen) basicly aligned, super long song / short phn / round in duration may cause mismatch
+                if pitch ls too short, do padding
+                if pitch ls too long, del zero first (each segment del min 0 segment length)
+                    then assume redundant zeros are all at the tail, cut them
 
-            #     在acesinger中，实际很多情况音频比note更长
-            #     '''
-            #     # print(f'debug -- difference {len(pc)-codec_T}')
-            #     if len(pc)-codec_T>20: # pitch_ls too long
-            #         del_length = find_shortest_zero_segment(pc)
-            #         pc = delete_zeros_from_segments(pc, del_length)
-            #     if len(pc)<codec_T:
-            #         updated_pitch = pc + [0] * (codec_T - len(pc)) 
-            #         processed_pitch.append(updated_pitch)        
-            #     elif len(pc)==codec_T:
-            #         processed_pitch.append(pc)
-            #     else:
-            #         updated_pitch = pc[:codec_T]
-            #         processed_pitch.append(updated_pitch)
+                在acesinger中，实际很多情况音频比note更长
+                '''
+                # print(f'debug -- difference {len(pc)-minT}')
+                if len(pc)-minT>20: # pitch_ls too long
+                    del_length = find_shortest_zero_segment(pc)
+                    pc = delete_zeros_from_segments(pc, del_length)
+                if len(pc)<minT:
+                    updated_pitch = pc + [0] * (minT - len(pc)) 
+                    processed_pitch.append(updated_pitch)        
+                elif len(pc)==minT:
+                    processed_pitch.append(pc)
+                else:
+                    updated_pitch = pc[:minT]
+                    processed_pitch.append(updated_pitch)
 
-            # # padded to maxpitch in preprocessing
-            # pitch_tensors = torch.tensor(processed_pitch)
-            # input_batch['pitch'] = pitch_tensors.to(device)
+            # padded to maxpitch in preprocessing
+            pitch_tensors = torch.tensor(processed_pitch)
+            input_batch['pitch'] = pitch_tensors.to(device)
 
 
             # NOTE(yiwen) update models
@@ -580,7 +571,7 @@ def train_one_epoch(model,
         # TODO(yiwen) save model (is able to resume on)
         # if epoch_id % 2 ==0:
         if os.path.exists(save_path):
-            os.rename(save_path, './debug_new_b.pth')
+            os.rename(save_path, './addcond_new_b.pth')
         torch.save({
             'epoch': epoch_id,
             'model_state_dict': model.state_dict(),
@@ -613,15 +604,15 @@ def valid(valid_data_loader):
     pass
 
 
-def save_h5(feats):
+def save_h5(feats, save_path):
     '''
     feats: 80, T
     '''
     feats = feats.transpose(0,1).detach().cpu().numpy()
     import h5py
-    with h5py.File("output_feature.h5", "w") as f:
+    with h5py.File(save_path, "w") as f:
         f.create_dataset("feats", data=feats)
-    print("Saved to output_feature.h5")
+    print(F"Saved to {save_path}")
 
 
 def inference(model,
@@ -633,7 +624,8 @@ def inference(model,
               codec_per_frame=8,
               ssl_per_frame=1,
               sample_rate=16000,
-              output_dir='./output_new'): 
+              output_dir='./output_melh5',
+              visualize=False): 
     '''
     Inputs:
         - pitch(list): as condition
@@ -646,96 +638,55 @@ def inference(model,
     codec_model.eval()
     token_per_frame = codec_per_frame + ssl_per_frame
 
+    current_cnt = 0
     for flatten_token, lengths, filenames, pitch in dataloader:
         # codec id to embedding
         flatten_codec = flatten_token.to(device).to(int) # already in range of codec, no padding, in shape [1, 1352]
         lengths = lengths.to(device)
 
-        print(f"debug -- filenames {filenames}")
+        current_cnt += 1
+        print(f"Processing -- {current_cnt}/{len(dataloader)}, {filenames}")
         with torch.no_grad():
             flatten_code_embedding = codec_model.detokenize(flatten_codec.to(int)).transpose(1, 2) # 1, 159, 512
         
-        # print(f'debug -- flatten_code_embedding.shape {flatten_code_embedding.shape}')
         # valid flatten length --> valid codec embedding
         lengths = lengths // 8 # code_per_frame
         
-        codec_T = flatten_code_embedding.shape[1]
+        minT = flatten_code_embedding.shape[1]
         processed_pitch = []
 
         # NOTE(yiwen) better pitch alignment in inference
-        # for pc in pitch:
-        #     '''
-        #     if pitch ls too short, do padding
-        #     if pitch ls too long, del zero first (each segment del min 0 segment length)
-        #         then assume redundant zeros are all at the tail, cut them
-        #     '''
-        #     if len(pc)-codec_T>20: # pitch_ls too long
-        #         del_length = find_shortest_zero_segment(pc)
-        #         pc = delete_zeros_from_segments(pc, del_length)
-        #     if len(pc)<codec_T:
-        #         updated_pitch = pc + [0] * (codec_T - len(pc)) 
-        #         processed_pitch.append(updated_pitch)        
-        #     elif len(pc)==codec_T:
-        #         processed_pitch.append(pc)
-        #     else:
-        #         updated_pitch = pc[:codec_T]
-        #         processed_pitch.append(updated_pitch)
-        # pitch_tensors = torch.tensor(processed_pitch)
+        for pc in pitch:
+            '''
+            if pitch ls too short, do padding
+            if pitch ls too long, del zero first (each segment del min 0 segment length)
+                then assume redundant zeros are all at the tail, cut them
+            '''
+            if len(pc)-minT>20: # pitch_ls too long
+                del_length = find_shortest_zero_segment(pc)
+                pc = delete_zeros_from_segments(pc, del_length)
+            if len(pc)<minT:
+                updated_pitch = pc + [0] * (minT - len(pc)) 
+                processed_pitch.append(updated_pitch)        
+            elif len(pc)==minT:
+                processed_pitch.append(pc)
+            else:
+                updated_pitch = pc[:minT]
+                processed_pitch.append(updated_pitch)
+        pitch_tensors = torch.tensor(processed_pitch)
         
-        # TODO(yiwen) this should be mel
-        output_feats = model.inference(flatten_code_embedding, lengths, sample_rate)
+        output_feats = model.inference(flatten_code_embedding, lengths, sample_rate, pitch_tensors)
         output_feats = output_feats.transpose(-1,-2).unsqueeze(1)
 
-        visualize_mel(output_feats, "Pred_mel.png") # B, 1, T', 80
+        if visualize:
+            visualize_mel(output_feats, "Pred_mel.png") # B, 1, T', 80
         
+        save_path = os.path.join(output_dir, f"{filenames[0]}.h5") # e.g. ./output_melh5/svs_acesinger_17#2086003208_sample1.h5
+        
+        # save mel in .h5 to a specific folder
         save_feats = output_feats.squeeze()
-        save_h5(save_feats)
+        save_h5(save_feats, save_path)
 
-        if vocoder_name == "hifigan":
-            waveforms = vocoder.decode_batch(output_feats[0]) # the first in the batch
-            print(f'debug -- waveforms.shape {waveforms.shape}')
-
-        elif vocoder_name == "bigvgan":
-            # generate waveform from mel
-            with torch.inference_mode():
-                wav_gen = vocoder(output_feats[0]) # wav_gen is FloatTensor with shape [B(1), 1, T_time] and values in [-1, 1]
-            waveforms = wav_gen.squeeze(0).cpu() # wav_gen is FloatTensor with shape [1, T_time]
-        
-        torchaudio.save('waveform_reconstructed.wav', waveforms.squeeze(1), 16000)
-
-
-        import pdb
-        pdb.set_trace()
-        # decode codec embedding to waveform
-        # with torch.no_grad():
-        #     waveform = codec_model.decode_continuous(output_feats).squeeze(1).cpu().numpy()
-            # waveform = codec_model.decode_continuous(flatten_code_embedding).squeeze(1).cpu().numpy() # debug, decode the original codec embedding
-        # save_name = os.path.join(output_dir, f'save_{filenames[0]}.wav')
-        # sf.write(save_name, waveform.T, samplerate=sample_rate)
-
-
-def load_vocoder(device, model_name="hifigan"):
-    if model_name == "hifigan":
-        from speechbrain.inference.vocoders import HIFIGAN
-        vocoder = HIFIGAN.from_hparams(source="speechbrain/tts-hifigan-libritts-16kHz", savedir="pretrained_models/tts-hifigan-libritts-16kHz")
-    
-    elif model_name == "bigvgan":
-        import sys
-        bigvgan_root = "/ocean/projects/cis210027p/yzhao16/BigVGAN/BigVGAN"
-        if bigvgan_root not in sys.path:
-            sys.path.insert(0, bigvgan_root)
-
-        import bigvgan
-        import librosa
-
-        # the pretrained mel channel=100, sr=24khz
-        model = bigvgan.BigVGAN.from_pretrained('/ocean/projects/cis210027p/yzhao16/BigVGAN/bigvgan_v2_24khz_100band_256x', use_cuda_kernel=False)
-
-        # remove weight norm in the model and set to eval mode
-        model.remove_weight_norm()
-        vocoder = model.eval().to(device)
-
-    return vocoder
 
 def get_batch_mel_lengths(
     lengths,
@@ -769,7 +720,7 @@ if __name__=='__main__':
 
     set_seed(42)
 
-    # TODO(yiwen) other conditions like spkprompt
+    # TODO(yiwen) other conditions like spkprompt, pitch
     # TODO(yiwen) add some visualization
                 # tSNE, mel spectrogram
     device = "cuda:0"
@@ -777,14 +728,12 @@ if __name__=='__main__':
     total_epochs = 30
 
     batch_size = 64
-    train = False
-    # train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/kising/speechlm1/dump/audio_raw_svs_kising/tr_no_dev/label" # NOTE(yiwen) debugging
-    # test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/kising/speechlm1/dump/audio_raw_svs_kising/eval/label"
+    train = True
     train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/tr_no_dev/label" # NOTE(yiwen) debugging
     test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/test/label"
-    output_dir = './output_new'
+    output_dir = './output_melh5'
 
-    latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/debug_new_l.pth"
+    latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/addcond_new_l.pth"
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -811,7 +760,6 @@ if __name__=='__main__':
         device=device,
     )
 
-    # NOTE(yiwen) temp choice
     optimizer = torch.optim.AdamW(maskedDiff.parameters(), lr=initial_lr)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -820,12 +768,6 @@ if __name__=='__main__':
         writer = SummaryWriter()
 
         ### train dataloader
-        # train_dataset = AudioDataset("./datasets/wav_dump/", 
-        #                                 transform=None, 
-        #                                 sample_rate=16000, 
-        #                                 label_file=train_label_file)
-
-        # TODO(yiwen) modify the test scproot and label file to train
         train_dataset = TrainDataset(audio_dir="./datasets/wav_dump/",
                                         scp_root="/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/exp/speechlm_opuslm_v1_1.7B_anneal_ext_phone_finetune_svs/decode_tts_espnet_sampling_temperature0.8_finetune_68epoch/svs_tr_no_dev/log",
                                         label_file=train_label_file,
@@ -848,10 +790,6 @@ if __name__=='__main__':
             maskedDiff.train()
             train_one_epoch(maskedDiff, optimizer, scheduler, train_data_loader, codec_model, device, epoch)
         
-        # TODO(yiwen) validation
-        # if epoch % valid_step == 0:
-        #     valid(maskedDiff, val_data_loader)
-
     else:
         ### test dataloader (need flatten code, need corresponding pitch)
         test_dataset = TestDataset(scp_root="/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/exp/speechlm_opuslm_v1_1.7B_anneal_ext_phone_finetune_svs/decode_tts_espnet_sampling_temperature0.8_finetune_68epoch/svs_test/log",
@@ -859,11 +797,6 @@ if __name__=='__main__':
                                     ark_root= "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1",
                                     sample_rate=16000, 
                                     )
-        # test_dataset = TestDataset(scp_root="/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/exp/speechlm_opuslm_v1_1.7B_anneal_ext_phone_finetune_svs/decode_tts_espnet_sampling_temperature0.8_finetune_68epoch/svs_tr_no_dev/log",
-        #                                 label_file=train_label_file,
-        #                                 ark_root= "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1",
-        #                                 sample_rate=16000, 
-        #                                 )
         # batchsize=1 in inference
         test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=True, num_workers=0, collate_fn=collate_fn_test)
 
@@ -873,8 +806,6 @@ if __name__=='__main__':
         epoch = checkpoint['epoch']
         loss = checkpoint['loss']
 
-        vocoder = load_vocoder(device, model_name=vocoder_name)
-
         maskedDiff.eval()
-        inference(maskedDiff, test_dataloader, codec_model, device, vocoder, vocoder_name)
+        inference(maskedDiff, test_dataloader, codec_model, device, output_dir=output_dir)
 
