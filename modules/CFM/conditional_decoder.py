@@ -225,9 +225,10 @@ class ConditionalDecoder(nn.Module):
 
         x = pack([x, mu], "b * t")[0] # 32, 512, 357 --> 32, 1024, 357 distribution along probability path || clean condition TODO(yiwen)把x和encoder output pack起来有什么意义吗
         # TEMP 1, 512, 169
-        if spks is not None:
-            spks = repeat(spks, "b c -> b c t", t=x.shape[-1])
-            x = pack([x, spks], "b * t")[0]
+        # if spks is not None:
+        #     spks = repeat(spks, "b c -> b c t", t=x.shape[-1])
+        #     x = pack([x, spks], "b * t")[0]
+        # TODO(yiwen) other method to inject spk_prompt since T could be various
         
         if cond is not None: # TODO(yiwen) shouldn't directly pack in channel dimension
             x = pack([x, cond], "b * t")[0] # cond should be in shape , , 357 (time is the same)

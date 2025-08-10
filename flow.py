@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Modifications:
+# - Modified by Yiwen Zhao, 2025-08-09: adapt to SLMSVS
+
 import sys
 import os
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
@@ -165,11 +169,12 @@ class MaskedDiff(torch.nn.Module):
             logging.warning(f"conds shape {conds.shape} does not match h shape {h.shape}, conds will be resized")
             conds = F.interpolate(conds, size=h.shape[1], mode='linear', align_corners=False)
 
+        spk_prompt = batch['spk_mel'].squeeze(1)
         loss, _ = self.decoder.compute_loss( 
                 x1=mel_spectrogram, # target
                 mask=mask.unsqueeze(1), # mask
                 mu=h.transpose(1, 2).contiguous(), # the encoder output (latent)
-                spks=None,
+                spks=spk_prompt, # TODO(yiwen) add spk cond here
                 cond=conds,)
 
         return {'loss': loss}
@@ -208,9 +213,9 @@ class MaskedDiff(torch.nn.Module):
         feat = self.decoder( # NOTE(yiwen) the output is in the same shape as mu
             mu=h.transpose(1, 2).contiguous(), # the input is the source codec token embedding
             mask=mask.unsqueeze(1),
-            spks=None,
+            spks=None, # TODO(yiwen) add spk cond here
             cond=conds,
-            n_timesteps=10 # 25
+            n_timesteps=10
         ) # get the feature, then pass to the vocoder
 
         feat = feat.transpose(1,2)
@@ -373,6 +378,7 @@ def collate_fn(batch):
     lengths_code = torch.tensor([item['length_code'] for item in batch])
     filenames = [item['filename'] for item in batch]
     pitchs = [item['pitch'] for item in batch]
+    spk_prompt = [item['spk_prompt'] for item in batch]
 
     max_len_code = max(lengths_code)
     max_len_wave = max(lengths_waveform)
@@ -389,7 +395,8 @@ def collate_fn(batch):
     for i, w in enumerate(waveforms):
         padded_waveforms[i, :, :w.shape[1]] = w
 
-    return flatten_codes, padded_waveforms, lengths_waveform, lengths_code, filenames, pitchs
+    batch_spk_prompt = torch.stack(spk_prompt, dim=0)
+    return flatten_codes, padded_waveforms, lengths_waveform, lengths_code, filenames, pitchs, batch_spk_prompt
 
 
 def get_codec(codec_model, waveform, length):
@@ -447,7 +454,7 @@ def train_one_epoch(model,
                     codec_per_frame=8,
                     ssl_per_frame=1,
                     embedding_dim=512,
-                    save_path='./addcond_new_l.pth'):
+                    save_path='./realdebug_l.pth'):
         ''' Train one epoch
         Args:
             - flatten_token: noisy codec token
@@ -469,7 +476,7 @@ def train_one_epoch(model,
 
         vis_mel = True # visualize the first element at the start of each epoch
 
-        for flatten_token, batch_waveforms, lengths_waveform, lengths_code, filenames, pitch in train_data_loader:
+        for flatten_token, batch_waveforms, lengths_waveform, lengths_code, filenames, pitch, spk_prompt in train_data_loader:
             num_batch += 1
             input_batch = {}
             
@@ -503,6 +510,9 @@ def train_one_epoch(model,
             mel_T = get_batch_mel_lengths(lengths_waveform) # a list, mel T length of each waveform sample in a batch
             mel_max_length = mel_T.max().item()
 
+            batch_spk_prompt = spk_prompt.to(device)
+            input_batch['spk_mel'] = waveform_to_mel(batch_spk_prompt, device=device) # fix length [B, 1, 80, 151]
+
             if vis_mel:
                 visualize_mel(input_batch['mel_spectrogram'], f"GT_mel{num_batch}.png")
                 vis_mel=False
@@ -520,7 +530,6 @@ def train_one_epoch(model,
             # TODO(yiwen) think about other conditions as well
             processed_pitch = []
 
-            # NOTE(yiwen) temp do not use pitch
             for pc in pitch:
                 '''
                 NOTE(yiwen) basicly aligned, super long song / short phn / round in duration may cause mismatch
@@ -550,6 +559,7 @@ def train_one_epoch(model,
 
             # NOTE(yiwen) update models
             optimizer.zero_grad()
+            import pdb; pdb.set_trace()
             output_loss_dic = model(input_batch, device)
             
             batch_loss = output_loss_dic['loss']
@@ -557,8 +567,7 @@ def train_one_epoch(model,
                 print(f'batch {num_batch} / total {num_batch_per_epoch} -- batch loss {batch_loss.item()}')
             if num_batch%100==0:
                 writer.add_scalar('Loss/train_batch', batch_loss.item(), epoch_id * len(train_data_loader) + num_batch) # cal by iteration
-            # if num_batch==100: # for debug
-            #     break
+            
             total_loss += batch_loss.item()
             batch_loss.backward()
             optimizer.step()
@@ -568,10 +577,8 @@ def train_one_epoch(model,
         total_loss /= num_batch
         logging.info(f'Training Loss for Epoch {epoch_id}: {total_loss}')
 
-        # TODO(yiwen) save model (is able to resume on)
-        # if epoch_id % 2 ==0:
         if os.path.exists(save_path):
-            os.rename(save_path, './addcond_new_b.pth')
+            os.rename(save_path, './realdebug_b.pth')
         torch.save({
             'epoch': epoch_id,
             'model_state_dict': model.state_dict(),
@@ -707,7 +714,6 @@ def get_batch_mel_lengths(
     Returns:
         1D tensor of mel frame lengths
     """
-    import torch
     if not torch.is_tensor(lengths):
         lengths = torch.tensor(lengths)
     pad = n_fft // 2 if center else 0
@@ -727,13 +733,13 @@ if __name__=='__main__':
     valid_step = 10
     total_epochs = 30
 
-    batch_size = 64
+    batch_size = 4
     train = True
-    train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/tr_no_dev/label" # NOTE(yiwen) debugging
+    train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/tr_no_dev/label"
     test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/test/label"
-    output_dir = './output_melh5'
+    output_dir = './output_melh5_cond_pitch'
 
-    latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/addcond_new_l.pth"
+    latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/realdebug_l.pth"
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -775,7 +781,7 @@ if __name__=='__main__':
                                         sample_rate=16000
                                         )
 
-        train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, collate_fn=collate_fn, drop_last=True,) # NOTE(yiwen) align batch with in_channel at flow.py NOTE 1
+        train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=collate_fn, drop_last=True,) # NOTE(yiwen) align batch with in_channel at flow.py NOTE 1
         pretrain_epoch = 0
 
         if os.path.exists(latest_model_file):
