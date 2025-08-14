@@ -77,6 +77,45 @@ class CausalConv1d(torch.nn.Conv1d):
         x = super(CausalConv1d, self).forward(x)
         return x
 
+
+class TransformerCrossBlock(nn.Module):
+    def __init__(self, d_model, cond_dim, n_heads, dropout=0.1):
+        super().__init__()
+
+        self.cond_mapping = nn.Linear(cond_dim, d_model)
+        self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * d_model, d_model),
+            nn.Dropout(dropout)
+        )
+        # LayerNorm
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, spks):
+        """
+        x: [B, D, T1] - query sequence
+        spks: [B, mD, T2] - key/value sequence
+        """
+        x = x.transpose(1,2)
+        spks = spks.transpose(1,2)
+
+        spks = self.cond_mapping(spks)
+
+        x2, _ = self.cross_attn(x, spks, spks)
+        x = self.norm1(x + self.dropout(x2))
+
+        x2 = self.ffn(x)
+        x = self.norm2(x + self.dropout(x2))
+        x = x.transpose(1,2)
+        return x
+
+
 class ConditionalDecoder(nn.Module):
     def __init__(
         self,
@@ -111,6 +150,9 @@ class ConditionalDecoder(nn.Module):
         self.up_blocks = nn.ModuleList([])
         # self.linear_input_project = nn.Linear(80, 512) # mel to feats
         # self.linear_output_project = nn.Linear(512, 80) # feats to mel
+
+        # NOTE(yiwen) need to comment out if no spkprompt
+        self.cond_fuse_cross_atten = TransformerCrossBlock(d_model=592, cond_dim=80, n_heads=4)
 
         output_channel = in_channels # TODO(yiwen) adjust for cond
         for i in range(len(channels)):  # pylint: disable=consider-using-enumerate
@@ -223,15 +265,16 @@ class ConditionalDecoder(nn.Module):
         t = self.time_embeddings(t).to(t.dtype) # 32 --> 32, 1024
         t = self.time_mlp(t) # 32, 1024 --> 32, 1024
 
-        x = pack([x, mu], "b * t")[0] # 32, 512, 357 --> 32, 1024, 357 distribution along probability path || clean condition TODO(yiwen)把x和encoder output pack起来有什么意义吗
+        x = pack([x, mu], "b * t")[0] # 32, 512, 357 --> 32, 1024, 357 distribution along probability path || clean condition
         # TEMP 1, 512, 169
-        # if spks is not None:
+        
+        if spks is not None:
+            x = self.cond_fuse_cross_atten(x, spks)
         #     spks = repeat(spks, "b c -> b c t", t=x.shape[-1])
         #     x = pack([x, spks], "b * t")[0]
-        # TODO(yiwen) other method to inject spk_prompt since T could be various
         
-        if cond is not None: # TODO(yiwen) shouldn't directly pack in channel dimension
-            x = pack([x, cond], "b * t")[0] # cond should be in shape , , 357 (time is the same)
+        if cond is not None:
+            x = pack([x, cond], "b * t")[0]
         
         hiddens = []
         masks = [mask] # 32, 1, 361

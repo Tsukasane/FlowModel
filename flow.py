@@ -454,7 +454,7 @@ def train_one_epoch(model,
                     codec_per_frame=8,
                     ssl_per_frame=1,
                     embedding_dim=512,
-                    save_path='./realdebug_l.pth'):
+                    save_path='./pitchandspkprompts_l.pth'):
         ''' Train one epoch
         Args:
             - flatten_token: noisy codec token
@@ -559,7 +559,6 @@ def train_one_epoch(model,
 
             # NOTE(yiwen) update models
             optimizer.zero_grad()
-            import pdb; pdb.set_trace()
             output_loss_dic = model(input_batch, device)
             
             batch_loss = output_loss_dic['loss']
@@ -578,7 +577,7 @@ def train_one_epoch(model,
         logging.info(f'Training Loss for Epoch {epoch_id}: {total_loss}')
 
         if os.path.exists(save_path):
-            os.rename(save_path, './realdebug_b.pth')
+            os.rename(save_path, './pitchandspkprompts_b.pth')
         torch.save({
             'epoch': epoch_id,
             'model_state_dict': model.state_dict(),
@@ -726,20 +725,19 @@ if __name__=='__main__':
 
     set_seed(42)
 
-    # TODO(yiwen) other conditions like spkprompt, pitch
     # TODO(yiwen) add some visualization
                 # tSNE, mel spectrogram
     device = "cuda:0"
     valid_step = 10
     total_epochs = 30
 
-    batch_size = 4
+    batch_size = 64
     train = True
     train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/tr_no_dev/label"
     test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/test/label"
     output_dir = './output_melh5_cond_pitch'
 
-    latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/realdebug_l.pth"
+    latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/pitchandspkprompts_l.pth"
 
     os.makedirs(output_dir, exist_ok=True)
 
