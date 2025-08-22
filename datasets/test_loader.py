@@ -8,8 +8,8 @@ import torch
 import torchaudio
 import torchaudio.transforms as T
 import kaldiio
-
-
+from glob import glob
+import random
 
 def extract_pitch_alongtime(line):
     parts = line.split()
@@ -43,6 +43,7 @@ class TestDataset(Dataset):
         self.label_file = label_file
         
         self.preprocess_pitch(label_file)
+        self.audio_dir="./datasets/wav_dump/"
 
 
         for i in range(split_size):
@@ -88,6 +89,38 @@ class TestDataset(Dataset):
                 self.pitch_dict[utt_id] = processed_line
         
 
+    def get_spkprompt(self, current_key, base_dir, sample_rate, min_duration=3.0):
+        """
+        randomly select a waveform from the same singer,
+        make sure the length>3s
+        """
+        singer_prefix = current_key.split('#')[0] + '#'
+        current_path = os.path.join(base_dir, f"{current_key}.wav")
+        
+        pattern = os.path.join(base_dir, f"{singer_prefix}*.wav")
+        candidates = [c for c in glob(pattern) if os.path.abspath(c) != os.path.abspath(current_path)]
+        
+        if not candidates:
+            return None, None
+        
+        while candidates:
+            candidate_path = random.choice(candidates)
+            waveform, sr = sf.read(candidate_path) 
+            duration = waveform.shape[0] / sr
+            if duration >= min_duration:
+                waveform = waveform[:int(sr*min_duration)]
+                waveform = torch.from_numpy(waveform).float()
+                if waveform.dim() == 1:
+                    waveform = waveform.unsqueeze(0)  # [1, T]
+                if sr != self.sample_rate:
+                    resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=sample_rate)
+                    waveform = resampler(waveform)
+                return waveform
+            else:
+                candidates.remove(candidate_path)
+        
+        return None, None 
+
     def __len__(self):
         return len(self.flattenCode_dict.items()) # the lm predict token length may be shorter than GT label pitch
 
@@ -96,11 +129,16 @@ class TestDataset(Dataset):
         pitch_key = "_".join(filename.split('_')[1:-1]) + '.wav'
         pitch = self.pitch_dict[pitch_key]
 
+        # for spk_prompt, same spk, diff utt
+        wav_filename = filename[4:-8] + '.wav'
+        raw_spk_prompt = self.get_spkprompt(wav_filename, self.audio_dir, self.sample_rate) # [1, 48000]
+
         return {
             "flatten_code": flatten_code,              # shape: [1, T]
             "length": flatten_code.shape[0],       # T
             "filename": filename,
-            "pitch": pitch
+            "pitch": pitch,
+            "raw_spk_prompt": raw_spk_prompt,
         }
 
 
@@ -109,6 +147,8 @@ def collate_fn(batch):
     lengths = torch.tensor([item['length'] for item in batch])
     filenames = [item['filename'] for item in batch]
     pitchs = [item['pitch'] for item in batch]
+    spk_prompts = [item['raw_spk_prompt'] for item in batch]
+
 
     max_len = max(lengths)
 
@@ -126,13 +166,15 @@ def collate_fn(batch):
     for i, fc in enumerate(flatten_codes):
         padded_flatten_code[i, :fc.shape[0]] = fc
 
-    return padded_flatten_code, lengths, filenames, pitchs
+    raw_spk_prompt = torch.stack(spk_prompts, dim=0)
+    return padded_flatten_code, lengths, filenames, pitchs, raw_spk_prompt
 
 
 
 if __name__ == "__main__":
-    dataset = TestDataset(scp_root="/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/exp/speechlm_naacl_demo_1.7B_lr5e-6/decode_tts_espnet_sampling_temperature0.8_finetune_70epoch/svs_test/log",
+    dataset = TestDataset(scp_root="/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/exp/speechlm_opuslm_v1_1.7B_anneal_ext_phone_finetune_svs/decode_tts_espnet_sampling_temperature0.8_finetune_68epoch/svs_test/log",
                             ark_root= "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1",
+                            label_file="/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/test/label",
                             sample_rate=16000, 
                             )
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=0, collate_fn=collate_fn)

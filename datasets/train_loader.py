@@ -8,8 +8,6 @@ import torchaudio.transforms as T
 import kaldiio
 from glob import glob
 
-
-
 def extract_pitch_alongtime(line):
     parts = line.split()
     uttid = parts[0]+".wav"

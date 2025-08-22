@@ -174,7 +174,7 @@ class MaskedDiff(torch.nn.Module):
                 x1=mel_spectrogram, # target
                 mask=mask.unsqueeze(1), # mask
                 mu=h.transpose(1, 2).contiguous(), # the encoder output (latent)
-                spks=spk_prompt, # TODO(yiwen) add spk cond here
+                spks=spk_prompt,
                 cond=conds,)
 
         return {'loss': loss}
@@ -185,6 +185,7 @@ class MaskedDiff(torch.nn.Module):
                   token_len,
                   sample_rate,
                   pitch=None,
+                  spk_prompt=None,
                   device='cuda:0'):
         """
         Args:
@@ -213,7 +214,7 @@ class MaskedDiff(torch.nn.Module):
         feat = self.decoder( # NOTE(yiwen) the output is in the same shape as mu
             mu=h.transpose(1, 2).contiguous(), # the input is the source codec token embedding
             mask=mask.unsqueeze(1),
-            spks=None, # TODO(yiwen) add spk cond here
+            spks=spk_prompt,
             cond=conds,
             n_timesteps=10
         ) # get the feature, then pass to the vocoder
@@ -527,7 +528,6 @@ def train_one_epoch(model,
             input_batch['mel_spectrogram'] = mel_modified
             input_batch['source_codec_feats'] = input_batch['source_codec_feats']
             
-            # TODO(yiwen) think about other conditions as well
             processed_pitch = []
 
             for pc in pitch:
@@ -592,6 +592,7 @@ def collate_fn_test(batch):
     lengths = torch.tensor([item['length'] for item in batch])
     filenames = [item['filename'] for item in batch]
     pitchs = [item['pitch'] for item in batch]
+    spk_prompts = [item['raw_spk_prompt'] for item in batch]
 
     max_len = max(lengths)
 
@@ -603,7 +604,8 @@ def collate_fn_test(batch):
     for i, fc in enumerate(flatten_codes):
         padded_flatten_code[i, :fc.shape[0]] = fc
 
-    return padded_flatten_code, lengths, filenames, pitchs
+    raw_spk_prompt = torch.stack(spk_prompts, dim=0)
+    return padded_flatten_code, lengths, filenames, pitchs, raw_spk_prompt
 
 
 def valid(valid_data_loader):
@@ -645,7 +647,7 @@ def inference(model,
     token_per_frame = codec_per_frame + ssl_per_frame
 
     current_cnt = 0
-    for flatten_token, lengths, filenames, pitch in dataloader:
+    for flatten_token, lengths, filenames, pitch, raw_spk_prompt in dataloader:
         # codec id to embedding
         flatten_codec = flatten_token.to(device).to(int) # already in range of codec, no padding, in shape [1, 1352]
         lengths = lengths.to(device)
@@ -660,6 +662,9 @@ def inference(model,
         
         minT = flatten_code_embedding.shape[1]
         processed_pitch = []
+
+        raw_spk_prompt = raw_spk_prompt.squeeze().to(device)
+        spk_prompt = waveform_to_mel(raw_spk_prompt, device=device).unsqueeze(0) # fix length [B, 1, 80, 151]
 
         # NOTE(yiwen) better pitch alignment in inference
         for pc in pitch:
@@ -681,7 +686,7 @@ def inference(model,
                 processed_pitch.append(updated_pitch)
         pitch_tensors = torch.tensor(processed_pitch)
         
-        output_feats = model.inference(flatten_code_embedding, lengths, sample_rate, pitch_tensors)
+        output_feats = model.inference(flatten_code_embedding, lengths, sample_rate, pitch_tensors, spk_prompt)
         output_feats = output_feats.transpose(-1,-2).unsqueeze(1)
 
         if visualize:
@@ -735,7 +740,7 @@ if __name__=='__main__':
     train = True
     train_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/tr_no_dev/label"
     test_label_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/dump/audio_raw_svs_acesinger/test/label"
-    output_dir = './output_melh5_cond_pitch'
+    output_dir = './output_melh5_cond_spkp_pitch'
 
     latest_model_file = "/ocean/projects/cis210027p/yzhao16/speechlm2/espnet/egs2/acesinger/speechlm1/flow_model/pitchandspkprompts_l.pth"
 
